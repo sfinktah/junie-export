@@ -173,6 +173,8 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Validate the output path as a git repository and use `git mv` for tracked renames.
 - `--git-bin`
   - Optional git executable path or directory. Relative paths are resolved against the process CWD at startup.
+- `-v`, `--verbose`
+  - Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 

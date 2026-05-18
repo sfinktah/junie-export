@@ -28,6 +28,8 @@ EVENT_MESSAGE_BLOCK_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionMessageBl
 EVENTS_FILE_SUFFIX = ".events"
 MARKDOWN_SUFFIX = ".md"
 DEFAULT_FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S - "
+WORKSPACE_SCAN_CHUNK_SIZE = 1024 * 1024
+MARKDOWN_UID_SCAN_SIZE = 1024
 SESSION_UID_RE = re.compile(
     r"Session UID:\s*`?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`?",
     re.IGNORECASE,
@@ -105,6 +107,11 @@ class ExportJob:
     existing_uids: dict[str, str | None]
 
 
+def verbose_print(verbose: bool, indent: int, message: str) -> None:
+    if verbose:
+        print(f"{' ' * indent}{message}", flush=True)
+
+
 def iter_input_files(paths: list[Path]) -> Iterator[tuple[Path, str]]:
     seen: set[Path] = set()
     for path in paths:
@@ -148,25 +155,45 @@ def should_flatten_output(paths: list[Path]) -> bool:
     return len(relative.parts) >= 2 and relative.parts[1] == "workspace"
 
 
-def iter_default_workspace_files() -> Iterator[tuple[Path, str]]:
+def workspace_file_has_chat_marker(xml_path: Path) -> bool:
+    marker = CHAT_SESSION_MARKER.encode("utf-8")
+    carry = b""
+
+    try:
+        with xml_path.open("rb") as fh:
+            while True:
+                chunk = fh.read(WORKSPACE_SCAN_CHUNK_SIZE)
+                if not chunk:
+                    return False
+                data = carry + chunk
+                if marker in data:
+                    return True
+                if len(marker) > 1:
+                    carry = data[-(len(marker) - 1) :]
+                else:
+                    carry = b""
+    except OSError:
+        return False
+
+
+def iter_default_workspace_files(verbose: bool = False) -> Iterator[tuple[Path, str]]:
     jetbrains_root = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roaming")) / "JetBrains"
     if not jetbrains_root.exists():
         return
 
-    for ide_dir in sorted(p for p in jetbrains_root.iterdir() if p.is_dir()):
-        workspace_dir = ide_dir / "workspace"
-        if not workspace_dir.is_dir():
-            continue
-        for xml_path in sorted(workspace_dir.glob("*.xml")):
-            if not xml_path.is_file():
+    verbose_print(verbose, 4, f"start scanning workspaces: {jetbrains_root}")
+    try:
+        for ide_dir in sorted(p for p in jetbrains_root.iterdir() if p.is_dir()):
+            workspace_dir = ide_dir / "workspace"
+            if not workspace_dir.is_dir():
                 continue
-            try:
-                text = xml_path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            if CHAT_SESSION_MARKER not in text:
-                continue
-            yield xml_path, ide_dir.name
+            for xml_path in sorted(workspace_dir.glob("*.xml")):
+                if not xml_path.is_file():
+                    continue
+                if workspace_file_has_chat_marker(xml_path):
+                    yield xml_path, ide_dir.name
+    finally:
+        verbose_print(verbose, 4, f"end scanning workspaces: {jetbrains_root}")
 
 
 def get_option_value(node: ET.Element, option_name: str) -> str | None:
@@ -178,10 +205,10 @@ def get_option_value(node: ET.Element, option_name: str) -> str | None:
     return None
 
 
-def extract_chat_sessions(xml_path: Path) -> list[ChatSession]:
+def extract_chat_sessions(xml_path: Path, verbose: bool = False) -> list[ChatSession]:
+    sessions: list[ChatSession] = []
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    sessions: list[ChatSession] = []
 
     for chat_node in root.findall(".//SerializedChat"):
         title_node = chat_node.find("./option[@name='title']/SerializedChatTitle")
@@ -240,18 +267,25 @@ def extract_chat_sessions(xml_path: Path) -> list[ChatSession]:
     return sessions
 
 
-def decode_event_records(path: Path) -> Iterator[dict]:
-    data = path.read_bytes().splitlines()
-    if not data:
-        return
-    start = 1 if data[0] == b"AUI_EVENTS_V1" else 0
-    for line in data[start:]:
-        if not line.strip():
-            continue
-        try:
-            yield json.loads(base64.b64decode(line))
-        except Exception:
-            continue
+def decode_event_records(path: Path, verbose: bool = False) -> Iterator[dict]:
+    verbose_print(verbose, 6, f"start decode_event_records: {path}")
+    count = 0
+    try:
+        data = path.read_bytes().splitlines()
+        if not data:
+            return
+        start = 1 if data[0] == b"AUI_EVENTS_V1" else 0
+        for line in data[start:]:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(base64.b64decode(line))
+            except Exception:
+                continue
+            count += 1
+            yield record
+    finally:
+        verbose_print(verbose, 6, f"end decode_event_records: {path} records={count}")
 
 
 def cache_root_for_ide(output_dir: Path, ide_name: str, flatten_ide_output: bool) -> Path:
@@ -309,6 +343,65 @@ def save_ide_cache(cache: IdeCache, use_disk_cache: bool = True) -> None:
 
     Path(temp_name).replace(cache_path)
     cache.dirty = False
+
+
+def prime_model_uid_indexes(cache: IdeCache, cache_root: Path, verbose: bool = False) -> None:
+    updated = False
+    verbose_print(verbose, 4, f"start scanning existing .md files: {cache_root}")
+
+    try:
+        if not cache_root.is_dir():
+            if cache.model_output_uids:
+                cache.model_output_uids.clear()
+                cache.dirty = True
+            return
+
+        for model_dir in sorted(path for path in cache_root.iterdir() if path.is_dir()):
+            model_component = model_dir.name
+            model_index = cache.model_output_uids.setdefault(model_component, {})
+            disk_names: set[str] = set()
+            scanned = 0
+            added = 0
+            removed = 0
+            verbose_print(verbose, 4, f"start reading existing .md files: {model_dir}")
+
+            for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
+                if not md_path.is_file():
+                    continue
+                scanned += 1
+                disk_names.add(md_path.name)
+                if md_path.name in model_index:
+                    continue
+                uid = read_session_uid_from_markdown(md_path)
+                model_index[md_path.name] = uid
+                added += 1
+                updated = True
+
+            missing_names = [name for name in model_index if name not in disk_names]
+            if missing_names:
+                for name in missing_names:
+                    del model_index[name]
+                removed = len(missing_names)
+                updated = True
+
+            verbose_print(
+                verbose,
+                4,
+                f"end reading existing .md files: {model_dir} scanned={scanned} added={added} removed={removed}",
+            )
+
+        for model_component in list(cache.model_output_uids):
+            model_dir = cache_root / model_component
+            if model_dir.is_dir():
+                continue
+            if cache.model_output_uids[model_component]:
+                cache.model_output_uids[model_component] = {}
+                updated = True
+
+        if updated:
+            cache.dirty = True
+    finally:
+        verbose_print(verbose, 4, f"end scanning existing .md files: {cache_root}")
 
 
 def resolve_git_executable(git_bin: str | None, start_cwd: Path) -> str:
@@ -413,48 +506,41 @@ def rename_many(rename_pairs: Iterable[tuple[Path, Path]], cwd: Path, git_execut
             raise RuntimeError(f"rename completed but destination is missing: {dst}")
 
 
-def ensure_model_uid_index(cache: IdeCache, model_dir: Path, model_component: str) -> dict[str, str | None]:
-    existing = dict(cache.model_output_uids.get(model_component, {}))
-    on_disk: dict[str, str | None] = {}
-    if model_dir.is_dir():
-        for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
-            if md_path.is_file():
-                uid = read_session_uid_from_markdown(md_path)
-                on_disk[md_path.name] = uid
-
-    if existing != on_disk:
-        existing = on_disk
-        cache.model_output_uids[model_component] = existing
-        cache.dirty = True
-        return existing
-
-    cache.model_output_uids[model_component] = existing
-    return existing
-
-
-def find_matching_task_history_file(cache: IdeCache, task_history_root: Path | None, prompt: str) -> Path | None:
+def find_matching_task_history_file(
+    cache: IdeCache,
+    task_history_root: Path | None,
+    prompt: str,
+    verbose: bool = False,
+) -> Path | None:
+    verbose_print(verbose, 4, f"start find_matching_task_history_file: {prompt!r}")
     cached = cache.prompt_to_events.get(prompt)
-    if cached:
-        cached_path = Path(cached)
-        if cached_path.is_file():
-            return cached_path
+    result: Path | None = None
+    try:
+        if cached:
+            cached_path = Path(cached)
+            if cached_path.is_file():
+                result = cached_path
+                return result
 
-    for root in iter_task_history_roots(task_history_root):
-        for candidate in sorted(root.glob(f"*{EVENTS_FILE_SUFFIX}")):
-            if not candidate.is_file():
-                continue
-            for record in decode_event_records(candidate):
-                if record.get("type") != EVENT_PROMPT_TYPE:
+        for root in iter_task_history_roots(task_history_root):
+            for candidate in sorted(root.glob(f"*{EVENTS_FILE_SUFFIX}")):
+                if not candidate.is_file():
                     continue
-                candidate_prompt = record.get("prompt")
-                if not isinstance(candidate_prompt, str):
-                    continue
-                if candidate_prompt not in cache.prompt_to_events:
-                    cache.prompt_to_events[candidate_prompt] = str(candidate)
-                    cache.dirty = True
-                if candidate_prompt == prompt:
-                    return candidate
-    return None
+                for record in decode_event_records(candidate, verbose=verbose):
+                    if record.get("type") != EVENT_PROMPT_TYPE:
+                        continue
+                    candidate_prompt = record.get("prompt")
+                    if not isinstance(candidate_prompt, str):
+                        continue
+                    if candidate_prompt not in cache.prompt_to_events:
+                        cache.prompt_to_events[candidate_prompt] = str(candidate)
+                        cache.dirty = True
+                    if candidate_prompt == prompt:
+                        result = candidate
+                        return result
+        return None
+    finally:
+        verbose_print(verbose, 4, f"end find_matching_task_history_file: {prompt!r} -> {result}")
 
 
 def summarize_block(event: dict) -> str | None:
@@ -535,30 +621,34 @@ def render_terminal_block(command: str, status: str, details: str) -> str:
     return "\n".join(lines)
 
 
-def build_turn_summaries(events_path: Path) -> list[RecoveredTurn]:
+def build_turn_summaries(events_path: Path, verbose: bool = False) -> list[RecoveredTurn]:
+    verbose_print(verbose, 4, f"start build_turn_summaries: {events_path}")
     turns: list[RecoveredTurn] = []
     current_prompt: str | None = None
     current_blocks: list[str] = []
 
-    for record in decode_event_records(events_path):
-        record_type = record.get("type")
-        if record_type == EVENT_PROMPT_TYPE:
-            if current_prompt is not None:
-                turns.append(RecoveredTurn(prompt=current_prompt, blocks=current_blocks))
-            current_prompt = record.get("prompt") or ""
-            current_blocks = []
-            continue
+    try:
+        for record in decode_event_records(events_path, verbose=verbose):
+            record_type = record.get("type")
+            if record_type == EVENT_PROMPT_TYPE:
+                if current_prompt is not None:
+                    turns.append(RecoveredTurn(prompt=current_prompt, blocks=current_blocks))
+                current_prompt = record.get("prompt") or ""
+                current_blocks = []
+                continue
 
-        if record_type == EVENT_MESSAGE_BLOCK_TYPE:
-            event = record.get("event") or {}
-            summary = summarize_block(event)
-            if summary:
-                current_blocks.append(summary)
+            if record_type == EVENT_MESSAGE_BLOCK_TYPE:
+                event = record.get("event") or {}
+                summary = summarize_block(event)
+                if summary:
+                    current_blocks.append(summary)
 
-    if current_prompt is not None:
-        turns.append(RecoveredTurn(prompt=current_prompt, blocks=current_blocks))
+        if current_prompt is not None:
+            turns.append(RecoveredTurn(prompt=current_prompt, blocks=current_blocks))
 
-    return turns
+        return turns
+    finally:
+        verbose_print(verbose, 4, f"end build_turn_summaries: {events_path} turns={len(turns)}")
 
 
 def iter_task_history_roots(task_history_root: Path | None) -> Iterator[Path]:
@@ -623,7 +713,8 @@ def extract_session_uid(text: str) -> str | None:
 
 def read_session_uid_from_markdown(path: Path) -> str | None:
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        with path.open("rb") as fh:
+            text = fh.read(MARKDOWN_UID_SCAN_SIZE).decode("utf-8", errors="ignore")
     except OSError:
         return None
     return extract_session_uid(text)
@@ -717,7 +808,12 @@ def has_assistant_content(session: ChatSession) -> bool:
     return False
 
 
-def recover_junie_turns(session: ChatSession, task_history_root: Path | None, cache: IdeCache) -> list[RecoveredTurn]:
+def recover_junie_turns(
+    session: ChatSession,
+    task_history_root: Path | None,
+    cache: IdeCache,
+    verbose: bool = False,
+) -> list[RecoveredTurn]:
     if not session.model_id.startswith("agent_"):
         return []
 
@@ -725,11 +821,11 @@ def recover_junie_turns(session: ChatSession, task_history_root: Path | None, ca
     if not first_prompt:
         return []
 
-    events_path = find_matching_task_history_file(cache, task_history_root, first_prompt)
+    events_path = find_matching_task_history_file(cache, task_history_root, first_prompt, verbose=verbose)
     if not events_path:
         return []
 
-    return build_turn_summaries(events_path)
+    return build_turn_summaries(events_path, verbose=verbose)
 
 
 def format_message(message: ChatMessage) -> str:
@@ -768,8 +864,10 @@ def render_session(session: ChatSession, source_name: str, recovered_turns: list
 
     for index, info_line in enumerate(info_lines):
         header_lines.append(info_line)
-        if index != len(info_lines) - 1:
-            header_lines.append("")
+        # These blank lines turn out to be very unattractive.  Unfortunately the JetBrains markdown viewer doesn't
+        # understand line breaks correctly.
+        # if index != len(info_lines) - 1:
+        #     header_lines.append("")
     header_lines.append("")
 
     assistant_turn_index = 0
@@ -973,6 +1071,12 @@ def main() -> int:
         action="store_true",
         help="Suppress progress and summary output.",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -991,6 +1095,7 @@ def main() -> int:
     used_paths: set[Path] = set()
     recovered_by_model: Counter[str] = Counter()
     written_by_model: Counter[str] = Counter()
+    verbose = args.verbose
     flatten_ide_output = should_flatten_output(args.paths)
     current_ide_name: str | None = None
     current_ide_cache: IdeCache | None = None
@@ -1071,7 +1176,7 @@ def main() -> int:
     if args.paths:
         input_items = iter_input_files(args.paths)
     else:
-        input_items = iter_default_workspace_files()
+        input_items = iter_default_workspace_files(verbose=verbose)
 
     try:
         for input_path, ide_name in input_items:
@@ -1082,6 +1187,9 @@ def main() -> int:
                     cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
                     use_disk_cache=not args.no_disk_cache,
                 )
+                prime_model_uid_indexes(current_ide_cache, current_ide_cache.cache_root, verbose=verbose)
+                if current_ide_cache.dirty:
+                    save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
                 if args.git:
                     current_ide_repo_root = git_root(current_ide_cache.cache_root, git_executable)
                     if current_ide_repo_root is None:
@@ -1094,7 +1202,9 @@ def main() -> int:
                 current_ide_rename_ops = []
                 if not args.quiet:
                     print(f"Processing IDE: {ide_name}", flush=True)
-            sessions = extract_chat_sessions(input_path)
+            verbose_print(verbose, 4, f"start extract_chat_sessions: {input_path}")
+            sessions = extract_chat_sessions(input_path, verbose=verbose)
+            verbose_print(verbose, 4, f"end extract_chat_sessions: {input_path} sessions={len(sessions)}")
             for session in sessions:
                 model_component = sanitize_path_component(session.model_id)
                 if flatten_ide_output:
@@ -1102,13 +1212,18 @@ def main() -> int:
                 else:
                     model_dir = current_ide_cache.cache_root / model_component
 
-                existing_uids = ensure_model_uid_index(current_ide_cache, model_dir, model_component)
+                existing_uids = current_ide_cache.model_index(model_component)
 
                 if args.ignore_existing and session.model_id.startswith("agent_"):
                     if has_existing_output_with_uid(existing_uids, session.uid):
                         continue
 
-                recovered_turns = recover_junie_turns(session, args.task_history_root, current_ide_cache)
+                recovered_turns = recover_junie_turns(
+                    session,
+                    args.task_history_root,
+                    current_ide_cache,
+                    verbose=verbose,
+                )
                 if not has_assistant_content(session) and not recovered_turns:
                     continue
 
