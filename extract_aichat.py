@@ -353,10 +353,8 @@ def decode_event_records(
                 debug_index.dumped_paths.add(resolved)
                 debug_index.debug_dir.mkdir(parents=True, exist_ok=True)
                 debug_path = debug_event_records_output_path(debug_index.debug_dir, resolved)
-                if debug_path.exists():
-                    raise FileExistsError(debug_path)
                 try:
-                    with debug_path.open("x", encoding="utf-8") as fh:
+                    with debug_path.open("w", encoding="utf-8") as fh:
                         fh.write(f"# source: {resolved}\n")
                         for record in records:
                             fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
