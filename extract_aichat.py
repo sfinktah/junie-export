@@ -734,6 +734,8 @@ def recover_junie_turns(session: ChatSession, task_history_root: Path | None, ca
 
 def format_message(message: ChatMessage) -> str:
     body = message.display_content
+    if message.author == "Assistant" and not body.strip() and not (message.internal_content and message.internal_content.strip()):
+        return ""
     parts: list[str] = [f"{message.author} said:"]
 
     if message.internal_content is not None and message.internal_content != message.display_content:
@@ -771,20 +773,26 @@ def render_session(session: ChatSession, source_name: str, recovered_turns: list
     header_lines.append("")
 
     assistant_turn_index = 0
-    for index, message in enumerate(session.messages, start=1):
-        if index > 1:
-            header_lines.append("")
+    emitted_message = False
+    for message in session.messages:
         body = message.display_content
         if message.author == "Assistant" and not body.strip() and assistant_turn_index < len(recovered_turns):
             recovered = recovered_turns[assistant_turn_index].to_markdown()
             if recovered.strip():
                 body = recovered
+        formatted = ""
         if message.author == "Assistant" and body.startswith("- "):
-            header_lines.append("Assistant did:")
-            header_lines.append("")
-            header_lines.append(body)
+            formatted = "\n".join(["Assistant did:", "", body])
         else:
-            header_lines.append(format_message(ChatMessage(message.author, body, message.internal_content)))
+            formatted = format_message(ChatMessage(message.author, body, message.internal_content))
+        if not formatted:
+            if message.author == "Assistant":
+                assistant_turn_index += 1
+            continue
+        if emitted_message:
+            header_lines.append("")
+        header_lines.append(formatted)
+        emitted_message = True
         if message.author == "Assistant":
             assistant_turn_index += 1
 
