@@ -175,6 +175,8 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Optional git executable path or directory. Relative paths are resolved against the process CWD at startup.
 - `-v`, `--verbose`
   - Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.
+- `-d`, `--debug`
+  - Write decoded event record files to `debug-event-records` under each IDE output directory.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import argparse
+import hashlib
 import os
 import platform
 import subprocess
@@ -10,7 +11,7 @@ import html
 import json
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -32,6 +33,10 @@ WORKSPACE_SCAN_CHUNK_SIZE = 1024 * 1024
 MARKDOWN_UID_SCAN_SIZE = 1024
 SESSION_UID_RE = re.compile(
     r"Session UID:\s*`?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`?",
+    re.IGNORECASE,
+)
+EVENT_FILENAME_UID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
     re.IGNORECASE,
 )
 FILENAME_SAFE_RE = re.compile(r"[^\w .()-]+", re.UNICODE)
@@ -107,6 +112,15 @@ class ExportJob:
     existing_uids: dict[str, str | None]
 
 
+@dataclass
+class TaskHistoryIndex:
+    candidate_paths: list[Path]
+    uid_to_path: dict[str, Path]
+    linked_paths: set[Path]
+    debug_dir: Path | None
+    dumped_paths: set[Path] = field(default_factory=set)
+
+
 def verbose_print(verbose: bool, indent: int, message: str) -> None:
     if verbose:
         print(f"{' ' * indent}{message}", flush=True)
@@ -174,6 +188,48 @@ def workspace_file_has_chat_marker(xml_path: Path) -> bool:
                     carry = b""
     except OSError:
         return False
+
+
+def debug_event_records_output_path(debug_dir: Path, source_path: Path) -> Path:
+    safe_name = "".join(ch if ch.isalnum() or ch in " .()-_" else "_" for ch in source_path.name)
+    digest = hashlib.blake2s(str(source_path).encode("utf-8"), digest_size=4).hexdigest()
+    return debug_dir / f"{safe_name}.{digest}.decoded.jsonl"
+
+
+def build_task_history_index(
+    task_history_root: Path | None,
+    verbose: bool = False,
+    debug_dir: Path | None = None,
+) -> TaskHistoryIndex:
+    verbose_print(verbose, 4, f"start build_task_history_index: {task_history_root or 'auto'}")
+    candidate_paths: list[Path] = []
+    uid_to_path: dict[str, Path] = {}
+
+    try:
+        for root in iter_task_history_roots(task_history_root):
+            for candidate in sorted(root.glob(f"*{EVENTS_FILE_SUFFIX}")):
+                if not candidate.is_file():
+                    continue
+                resolved = candidate.resolve()
+                candidate_paths.append(resolved)
+                match = EVENT_FILENAME_UID_RE.search(candidate.name)
+                if match:
+                    uid = match.group(1).lower()
+                    uid_to_path.setdefault(uid, resolved)
+
+        linked_paths = set(uid_to_path.values())
+        return TaskHistoryIndex(
+            candidate_paths=candidate_paths,
+            uid_to_path=uid_to_path,
+            linked_paths=linked_paths,
+            debug_dir=debug_dir,
+        )
+    finally:
+        verbose_print(
+            verbose,
+            4,
+            f"end build_task_history_index: candidates={len(candidate_paths)} linked={len(uid_to_path)}",
+        )
 
 
 def iter_default_workspace_files(verbose: bool = False) -> Iterator[tuple[Path, str]]:
@@ -267,9 +323,14 @@ def extract_chat_sessions(xml_path: Path, verbose: bool = False) -> list[ChatSes
     return sessions
 
 
-def decode_event_records(path: Path, verbose: bool = False) -> Iterator[dict]:
+def decode_event_records(
+    path: Path,
+    verbose: bool = False,
+    debug_index: TaskHistoryIndex | None = None,
+) -> Iterator[dict]:
     verbose_print(verbose, 6, f"start decode_event_records: {path}")
     count = 0
+    records: list[dict] = []
     try:
         data = path.read_bytes().splitlines()
         if not data:
@@ -283,8 +344,25 @@ def decode_event_records(path: Path, verbose: bool = False) -> Iterator[dict]:
             except Exception:
                 continue
             count += 1
+            records.append(record)
             yield record
     finally:
+        if debug_index is not None and debug_index.debug_dir is not None:
+            resolved = path.resolve()
+            if resolved not in debug_index.dumped_paths:
+                debug_index.dumped_paths.add(resolved)
+                debug_index.debug_dir.mkdir(parents=True, exist_ok=True)
+                debug_path = debug_event_records_output_path(debug_index.debug_dir, resolved)
+                if debug_path.exists():
+                    raise FileExistsError(debug_path)
+                try:
+                    with debug_path.open("x", encoding="utf-8") as fh:
+                        fh.write(f"# source: {resolved}\n")
+                        for record in records:
+                            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                            fh.write("\n")
+                except OSError:
+                    pass
         verbose_print(verbose, 6, f"end decode_event_records: {path} records={count}")
 
 
@@ -508,11 +586,22 @@ def rename_many(rename_pairs: Iterable[tuple[Path, Path]], cwd: Path, git_execut
 
 def find_matching_task_history_file(
     cache: IdeCache,
+    task_history_index: TaskHistoryIndex,
     task_history_root: Path | None,
     prompt: str,
+    session_uid: str | None,
     verbose: bool = False,
 ) -> Path | None:
     verbose_print(verbose, 4, f"start find_matching_task_history_file: {prompt!r}")
+    if session_uid is not None:
+        direct_path = task_history_index.uid_to_path.get(session_uid)
+        if direct_path is not None and direct_path.is_file():
+            if prompt not in cache.prompt_to_events:
+                cache.prompt_to_events[prompt] = str(direct_path)
+                cache.dirty = True
+            verbose_print(verbose, 4, f"end find_matching_task_history_file: {prompt!r} -> {direct_path}")
+            return direct_path
+
     cached = cache.prompt_to_events.get(prompt)
     result: Path | None = None
     try:
@@ -522,11 +611,12 @@ def find_matching_task_history_file(
                 result = cached_path
                 return result
 
-        for root in iter_task_history_roots(task_history_root):
-            for candidate in sorted(root.glob(f"*{EVENTS_FILE_SUFFIX}")):
-                if not candidate.is_file():
-                    continue
-                for record in decode_event_records(candidate, verbose=verbose):
+        for candidate in task_history_index.candidate_paths:
+            if candidate in task_history_index.linked_paths:
+                continue
+            if not candidate.is_file():
+                continue
+            for record in decode_event_records(candidate, verbose=verbose, debug_index=task_history_index):
                     if record.get("type") != EVENT_PROMPT_TYPE:
                         continue
                     candidate_prompt = record.get("prompt")
@@ -621,14 +711,18 @@ def render_terminal_block(command: str, status: str, details: str) -> str:
     return "\n".join(lines)
 
 
-def build_turn_summaries(events_path: Path, verbose: bool = False) -> list[RecoveredTurn]:
+def build_turn_summaries(
+    events_path: Path,
+    verbose: bool = False,
+    debug_index: TaskHistoryIndex | None = None,
+) -> list[RecoveredTurn]:
     verbose_print(verbose, 4, f"start build_turn_summaries: {events_path}")
     turns: list[RecoveredTurn] = []
     current_prompt: str | None = None
     current_blocks: list[str] = []
 
     try:
-        for record in decode_event_records(events_path, verbose=verbose):
+        for record in decode_event_records(events_path, verbose=verbose, debug_index=debug_index):
             record_type = record.get("type")
             if record_type == EVENT_PROMPT_TYPE:
                 if current_prompt is not None:
@@ -812,6 +906,7 @@ def recover_junie_turns(
     session: ChatSession,
     task_history_root: Path | None,
     cache: IdeCache,
+    task_history_index: TaskHistoryIndex,
     verbose: bool = False,
 ) -> list[RecoveredTurn]:
     if not session.model_id.startswith("agent_"):
@@ -821,11 +916,18 @@ def recover_junie_turns(
     if not first_prompt:
         return []
 
-    events_path = find_matching_task_history_file(cache, task_history_root, first_prompt, verbose=verbose)
+    events_path = find_matching_task_history_file(
+        cache,
+        task_history_index,
+        task_history_root,
+        first_prompt,
+        session.uid,
+        verbose=verbose,
+    )
     if not events_path:
         return []
 
-    return build_turn_summaries(events_path, verbose=verbose)
+    return build_turn_summaries(events_path, verbose=verbose, debug_index=task_history_index)
 
 
 def format_message(message: ChatMessage) -> str:
@@ -1077,6 +1179,12 @@ def main() -> int:
         action="store_true",
         help="Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.",
     )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Write decoded event record files to debug-event-records under each IDE output directory.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1096,9 +1204,11 @@ def main() -> int:
     recovered_by_model: Counter[str] = Counter()
     written_by_model: Counter[str] = Counter()
     verbose = args.verbose
+    debug = args.debug
     flatten_ide_output = should_flatten_output(args.paths)
     current_ide_name: str | None = None
     current_ide_cache: IdeCache | None = None
+    current_ide_task_history_index: TaskHistoryIndex | None = None
     current_ide_repo_root: Path | None = None
     current_ide_jobs: list[ExportJob] = []
     current_ide_rename_ops: list[tuple[Path, Path, dict[str, str | None]]] = []
@@ -1108,7 +1218,7 @@ def main() -> int:
     current_ide_written_by_model: Counter[str] = Counter()
 
     def flush_current_ide_state() -> None:
-        nonlocal current_ide_name, current_ide_cache, current_ide_repo_root
+        nonlocal current_ide_name, current_ide_cache, current_ide_task_history_index, current_ide_repo_root
         nonlocal current_ide_jobs, current_ide_rename_ops
         nonlocal current_ide_recovered, current_ide_written
         nonlocal current_ide_recovered_by_model, current_ide_written_by_model
@@ -1152,6 +1262,7 @@ def main() -> int:
 
         if current_ide_cache is not None:
             current_ide_cache = None
+        current_ide_task_history_index = None
         current_ide_repo_root = None
         current_ide_jobs = []
         current_ide_rename_ops = []
@@ -1190,6 +1301,12 @@ def main() -> int:
                 prime_model_uid_indexes(current_ide_cache, current_ide_cache.cache_root, verbose=verbose)
                 if current_ide_cache.dirty:
                     save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
+                debug_dir = current_ide_cache.cache_root / "debug-event-records" if debug else None
+                current_ide_task_history_index = build_task_history_index(
+                    args.task_history_root,
+                    verbose=verbose,
+                    debug_dir=debug_dir,
+                )
                 if args.git:
                     current_ide_repo_root = git_root(current_ide_cache.cache_root, git_executable)
                     if current_ide_repo_root is None:
@@ -1222,6 +1339,7 @@ def main() -> int:
                     session,
                     args.task_history_root,
                     current_ide_cache,
+                    current_ide_task_history_index,
                     verbose=verbose,
                 )
                 if not has_assistant_content(session) and not recovered_turns:
