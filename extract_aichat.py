@@ -522,8 +522,9 @@ def summarize_block(event: dict) -> str | None:
 
 def render_terminal_block(command: str, status: str, details: str) -> str:
     heading = "Terminal"
-    if status:
-        heading = f"Terminal ({status})"
+    status = (status or "").strip()
+    if status and status != "COMPLETED":
+        heading = f"Terminal _({status.lower()})_"
 
     lines = [f"{heading}:"]
     lines.append("```powershell")
