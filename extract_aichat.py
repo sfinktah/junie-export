@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import html
 import json
 import re
+import tempfile
 from dataclasses import dataclass
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,12 @@ DEFAULT_INPUT = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roami
 DEFAULT_OUTPUT_DIR = Path(r"C:\tmp\aichat")
 CHAT_SESSION_MARKER = '<component name="ChatSessionStateTemp">'
 SESSION_UID_PREFIX = "Session UID: `"
+IDE_CACHE_FILENAME = ".aichat_export_cache.json"
+IDE_CACHE_VERSION = 1
+EVENT_PROMPT_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionUserPromptEvent"
+EVENT_MESSAGE_BLOCK_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionMessageBlockEvent"
+EVENTS_FILE_SUFFIX = ".events"
+MARKDOWN_SUFFIX = ".md"
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,17 @@ class RecoveredTurn:
             for continuation in block_lines[1:]:
                 lines.append(f"  {continuation}" if continuation else "  ")
         return "\n".join(lines)
+
+
+@dataclass
+class IdeCache:
+    cache_root: Path
+    model_output_uids: dict[str, dict[str, str | None]]
+    prompt_to_events: dict[str, str]
+    dirty: bool = False
+
+    def model_index(self, model_component: str) -> dict[str, str | None]:
+        return self.model_output_uids.setdefault(model_component, {})
 
 
 def iter_input_files(paths: list[Path]) -> Iterator[tuple[Path, str]]:
@@ -205,6 +223,103 @@ def decode_event_records(path: Path) -> Iterator[dict]:
             continue
 
 
+def cache_root_for_ide(output_dir: Path, ide_name: str, flatten_ide_output: bool) -> Path:
+    if flatten_ide_output:
+        return output_dir
+    return output_dir / sanitize_path_component(ide_name)
+
+
+def load_ide_cache(cache_root: Path, use_disk_cache: bool = True) -> IdeCache:
+    cache_path = cache_root / IDE_CACHE_FILENAME
+    model_output_uids: dict[str, dict[str, str | None]] = {}
+    prompt_to_events: dict[str, str] = {}
+
+    if use_disk_cache and cache_path.is_file():
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict) and raw.get("version") == IDE_CACHE_VERSION:
+            raw_models = raw.get("model_output_uids")
+            if isinstance(raw_models, dict):
+                for model_name, model_index in raw_models.items():
+                    if not isinstance(model_name, str) or not isinstance(model_index, dict):
+                        continue
+                    cleaned: dict[str, str | None] = {}
+                    for filename, session_uid in model_index.items():
+                        if isinstance(filename, str):
+                            cleaned[filename] = session_uid if isinstance(session_uid, str) or session_uid is None else None
+                    model_output_uids[model_name] = cleaned
+            raw_prompts = raw.get("prompt_to_events")
+            if isinstance(raw_prompts, dict):
+                for prompt, events_path in raw_prompts.items():
+                    if isinstance(prompt, str) and isinstance(events_path, str):
+                        prompt_to_events[prompt] = events_path
+
+    return IdeCache(cache_root=cache_root, model_output_uids=model_output_uids, prompt_to_events=prompt_to_events)
+
+
+def save_ide_cache(cache: IdeCache, use_disk_cache: bool = True) -> None:
+    if not use_disk_cache or not cache.dirty:
+        return
+
+    cache.cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = cache.cache_root / IDE_CACHE_FILENAME
+    payload = {
+        "version": IDE_CACHE_VERSION,
+        "model_output_uids": cache.model_output_uids,
+        "prompt_to_events": cache.prompt_to_events,
+    }
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=cache.cache_root, prefix=".aichat_export.", suffix=".tmp") as tmp:
+        json.dump(payload, tmp, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp.write("\n")
+        temp_name = tmp.name
+
+    Path(temp_name).replace(cache_path)
+    cache.dirty = False
+
+
+def ensure_model_uid_index(cache: IdeCache, model_dir: Path, model_component: str) -> dict[str, str | None]:
+    existing = cache.model_output_uids.get(model_component)
+    if existing is not None:
+        return existing
+
+    existing = {}
+    if model_dir.is_dir():
+        for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
+            if md_path.is_file():
+                existing[md_path.name] = read_session_uid_from_markdown(md_path)
+    cache.model_output_uids[model_component] = existing
+    cache.dirty = True
+    return existing
+
+
+def find_matching_task_history_file(cache: IdeCache, task_history_root: Path | None, prompt: str) -> Path | None:
+    cached = cache.prompt_to_events.get(prompt)
+    if cached:
+        cached_path = Path(cached)
+        if cached_path.is_file():
+            return cached_path
+
+    for root in iter_task_history_roots(task_history_root):
+        for candidate in sorted(root.glob(f"*{EVENTS_FILE_SUFFIX}")):
+            if not candidate.is_file():
+                continue
+            for record in decode_event_records(candidate):
+                if record.get("type") != EVENT_PROMPT_TYPE:
+                    continue
+                candidate_prompt = record.get("prompt")
+                if not isinstance(candidate_prompt, str):
+                    continue
+                if candidate_prompt not in cache.prompt_to_events:
+                    cache.prompt_to_events[candidate_prompt] = str(candidate)
+                    cache.dirty = True
+                if candidate_prompt == prompt:
+                    return candidate
+    return None
+
+
 def summarize_block(event: dict) -> str | None:
     kind = event.get("kind")
     if kind == "com.intellij.ml.llm.aui.events.api.TerminalBlockUpdatedEvent":
@@ -291,14 +406,14 @@ def build_turn_summaries(events_path: Path) -> list[RecoveredTurn]:
 
     for record in decode_event_records(events_path):
         record_type = record.get("type")
-        if record_type == "com.intellij.ml.llm.chat.shared.ChatSessionUserPromptEvent":
+        if record_type == EVENT_PROMPT_TYPE:
             if current_prompt is not None:
                 turns.append(RecoveredTurn(prompt=current_prompt, blocks=current_blocks))
             current_prompt = record.get("prompt") or ""
             current_blocks = []
             continue
 
-        if record_type == "com.intellij.ml.llm.chat.shared.ChatSessionMessageBlockEvent":
+        if record_type == EVENT_MESSAGE_BLOCK_TYPE:
             event = record.get("event") or {}
             summary = summarize_block(event)
             if summary:
@@ -324,21 +439,6 @@ def iter_task_history_roots(task_history_root: Path | None) -> Iterator[Path]:
         candidate = ide_dir / "aia-task-history"
         if candidate.is_dir():
             yield candidate
-
-
-def find_matching_task_history_file(
-    task_history_root: Path | None,
-    prompt: str,
-) -> Path | None:
-    for root in iter_task_history_roots(task_history_root):
-        candidates = sorted(root.glob("*.events"))
-        for candidate in candidates:
-            for record in decode_event_records(candidate):
-                if record.get("type") != "com.intellij.ml.llm.chat.shared.ChatSessionUserPromptEvent":
-                    continue
-                if record.get("prompt") == prompt:
-                    return candidate
-    return None
 
 
 def sanitize_filename(title: str) -> str:
@@ -368,6 +468,24 @@ def read_session_uid_from_markdown(path: Path) -> str | None:
     return None
 
 
+def has_existing_output_with_uid(
+    title: str,
+    session_uid: str | None,
+    existing_uids: dict[str, str | None],
+) -> bool:
+    base = sanitize_filename(title)
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f"_{counter}"
+        candidate_name = f"{base}{suffix}{MARKDOWN_SUFFIX}"
+        if candidate_name not in existing_uids:
+            return False
+        existing_uid = existing_uids[candidate_name]
+        if existing_uid is not None and existing_uid == session_uid:
+            return True
+        counter += 1
+
+
 def quote_block(text: str) -> str:
     lines = text.splitlines() or [""]
     return "\n".join(f"> {line}" if line else ">" for line in lines)
@@ -390,7 +508,7 @@ def has_assistant_content(session: ChatSession) -> bool:
     return False
 
 
-def recover_junie_turns(session: ChatSession, task_history_root: Path | None) -> list[RecoveredTurn]:
+def recover_junie_turns(session: ChatSession, task_history_root: Path | None, cache: IdeCache) -> list[RecoveredTurn]:
     if not session.model_id.startswith("agent_"):
         return []
 
@@ -398,7 +516,7 @@ def recover_junie_turns(session: ChatSession, task_history_root: Path | None) ->
     if not first_prompt:
         return []
 
-    events_path = find_matching_task_history_file(task_history_root, first_prompt)
+    events_path = find_matching_task_history_file(cache, task_history_root, first_prompt)
     if not events_path:
         return []
 
@@ -531,8 +649,10 @@ def resolve_output_path(
     session_uid: str | None,
     ignore_existing: bool,
     used: set[Path],
+    existing_uids: dict[str, str | None],
 ) -> Path | None:
     base = sanitize_filename(title)
+    missing = object()
     counter = 0
     while True:
         suffix = "" if counter == 0 else f"_{counter}"
@@ -541,9 +661,13 @@ def resolve_output_path(
             counter += 1
             continue
 
-        if candidate.exists():
+        existing_uid = existing_uids.get(candidate.name, missing)
+        if existing_uid is missing and candidate.exists():
             existing_uid = read_session_uid_from_markdown(candidate)
-            if existing_uid == session_uid:
+            existing_uids[candidate.name] = existing_uid
+
+        if existing_uid is not missing:
+            if existing_uid is not None and existing_uid == session_uid:
                 if ignore_existing:
                     return None
                 used.add(candidate)
@@ -553,26 +677,6 @@ def resolve_output_path(
 
         used.add(candidate)
         return candidate
-
-
-def has_existing_output_with_uid(
-    output_dir: Path,
-    title: str,
-    session_uid: str | None,
-) -> bool:
-    base = sanitize_filename(title)
-    counter = 0
-    while True:
-        suffix = "" if counter == 0 else f"_{counter}"
-        candidate = output_dir / f"{base}{suffix}.md"
-        if not candidate.exists():
-            return False
-
-        existing_uid = read_session_uid_from_markdown(candidate)
-        if existing_uid == session_uid:
-            return True
-
-        counter += 1
 
 
 def main() -> int:
@@ -602,6 +706,11 @@ def main() -> int:
         help="Skip writing a file when an existing export has the same session UID.",
     )
     parser.add_argument(
+        "--no-disk-cache",
+        action="store_true",
+        help="Disable reading and writing the on-disk .aichat_export_cache.json file.",
+    )
+    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -617,14 +726,17 @@ def main() -> int:
     written_by_model: Counter[str] = Counter()
     flatten_ide_output = should_flatten_output(args.paths)
     current_ide_name: str | None = None
+    current_ide_cache: IdeCache | None = None
     current_ide_recovered = 0
     current_ide_written = 0
     current_ide_recovered_by_model: Counter[str] = Counter()
     current_ide_written_by_model: Counter[str] = Counter()
 
     def flush_current_ide_summary() -> None:
-        nonlocal current_ide_name, current_ide_recovered, current_ide_written
+        nonlocal current_ide_name, current_ide_cache, current_ide_recovered, current_ide_written
         nonlocal current_ide_recovered_by_model, current_ide_written_by_model
+        if current_ide_cache is not None:
+            save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
         if current_ide_name is None or args.quiet:
             return
         if current_ide_recovered == 0:
@@ -651,6 +763,10 @@ def main() -> int:
         if ide_name != current_ide_name:
             flush_current_ide_summary()
             current_ide_name = ide_name
+            current_ide_cache = load_ide_cache(
+                cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
+                use_disk_cache=not args.no_disk_cache,
+            )
             current_ide_recovered = 0
             current_ide_written = 0
             current_ide_recovered_by_model = Counter()
@@ -658,17 +774,25 @@ def main() -> int:
             if not args.quiet:
                 print(f"Processing IDE: {ide_name}", flush=True)
         sessions = extract_chat_sessions(input_path)
+        if current_ide_cache is None:
+            current_ide_cache = load_ide_cache(
+                cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
+                use_disk_cache=not args.no_disk_cache,
+            )
         for session in sessions:
+            model_component = sanitize_path_component(session.model_id)
             if flatten_ide_output:
-                model_dir = args.output_dir / sanitize_path_component(session.model_id)
+                model_dir = args.output_dir / model_component
             else:
-                model_dir = args.output_dir / sanitize_path_component(ide_name) / sanitize_path_component(session.model_id)
+                model_dir = current_ide_cache.cache_root / model_component
+
+            existing_uids = ensure_model_uid_index(current_ide_cache, model_dir, model_component)
 
             if args.ignore_existing and session.model_id.startswith("agent_"):
-                if has_existing_output_with_uid(model_dir, session.title, session.uid):
+                if has_existing_output_with_uid(session.title, session.uid, existing_uids):
                     continue
 
-            recovered_turns = recover_junie_turns(session, args.task_history_root)
+            recovered_turns = recover_junie_turns(session, args.task_history_root, current_ide_cache)
             if not has_assistant_content(session) and not recovered_turns:
                 continue
 
@@ -682,6 +806,7 @@ def main() -> int:
                 session.uid,
                 args.ignore_existing,
                 used_paths,
+                existing_uids,
             )
             if output_path is None:
                 continue
@@ -689,6 +814,8 @@ def main() -> int:
                 render_session(session, source_name=str(input_path), recovered_turns=recovered_turns),
                 encoding="utf-8",
             )
+            existing_uids[output_path.name] = session.uid
+            current_ide_cache.dirty = True
             if session.timestamp_ms is not None:
                 try:
                     set_file_timestamp(str(output_path), session.timestamp_ms)
@@ -700,6 +827,8 @@ def main() -> int:
             sessions_written += 1
 
     flush_current_ide_summary()
+    if current_ide_cache is not None:
+        save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
 
     if not args.quiet:
         print(f"Grand total: Wrote {sessions_written} chat markdown file(s) to {args.output_dir}", flush=True)

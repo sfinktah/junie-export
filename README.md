@@ -139,6 +139,8 @@ If a filename collision occurs, it appends either:
 
 to preserve all exports without overwriting.
 
+The per-IDE cache is a performance hint, not a source of truth. If it gets out of sync, delete it and rerun.
+
 ## Command Line Arguments
 
 `extract_aichat.py` accepts these arguments:
@@ -156,6 +158,27 @@ to preserve all exports without overwriting.
   - If omitted, the script auto-discovers `aia-task-history` directories under `%APPDATA%\JetBrains\<IDE>\`.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
+- `--no-disk-cache`
+  - Disable reading and writing the on-disk `.aichat_export_cache.json` file.
+
+The exporter keeps a per-IDE cache at:
+
+```text
+<output-dir>\<IDE>\.aichat_export_cache.json
+```
+
+When you pass exactly one explicit IDE root or workspace file and the exporter flattens the output layout, the cache lives directly under the output directory instead:
+
+```text
+<output-dir>\.aichat_export_cache.json
+```
+
+That cache stores:
+
+- per-model markdown filename to session UID indexes
+- prompt-to-`aia-task-history` file lookups
+
+It is there to make repeat runs cheaper, especially the common "just grab the new conversations" workflow and reruns with `--ignore-existing`. If you manually move, delete, or edit exported markdown files outside the exporter, delete the cache file as well so the next run rebuilds it from disk. Use `--no-disk-cache` when you want the exporter to ignore the cache entirely for a run.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 
