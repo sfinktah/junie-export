@@ -5,7 +5,7 @@
 It handles two sources of content:
 
 1. Direct XML chat text stored in `SerializedChatMessage` nodes.
-2. Recovered Junie action history from JetBrains `aia-task-history` event logs when the XML assistant message is empty.
+2. Recovered agent action history from JetBrains `aia-task-history` event logs when the XML assistant message is empty.
 
 The output is grouped by IDE name and `chatModelId`, so the final path shape is:
 
@@ -26,7 +26,7 @@ The default output directory is `C:\tmp\aichat\`, but you can point it anywhere.
 - Timestamp derived from `statisticInformation.timestamp`
 - `modifiedAt` when it differs from `statisticInformation.timestamp`
 - Messages in conversation order
-- Junie assistant actions recovered from `aia-task-history`
+- agent assistant actions recovered from `aia-task-history`
 
 ## High-Level Flow
 
@@ -83,8 +83,9 @@ The renderer applies these rules:
   - session UID
   - `chatModelId`
   - `sourceActionType`
-  - timestamp rendered as an ISO 8601 UTC string
+  - timestamp rendered in the local timezone as `yyyy-mm-dd hh:mm:ss`
   - `modifiedAt` rendered underneath it when it differs
+- Blank lines separate each header field.
 - Every message is prefixed with `<author> said:`.
 - Non-Assistant message bodies are quoted with markdown blockquote syntax.
 - If `displayContent` and `internalContent` differ, the exporter writes both values and labels them explicitly.
@@ -107,7 +108,7 @@ The event files are not SQLite. They are newline-delimited base64-encoded JSON r
 
 ### Event record formats
 
-The exporter knows how to summarize these Junie block event kinds:
+The exporter knows how to summarize these agent block event kinds:
 
 - `TerminalBlockUpdatedEvent`
 - `AgentThoughtBlockUpdatedEvent`
@@ -120,7 +121,7 @@ Those summaries are inserted into recovered assistant sections as plain markdown
 
 ### Output path handling
 
-Paths are sanitized for Windows compatibility. The exporter creates:
+Paths are sanitized for Windows and Unix compatibility. The exporter creates:
 
 ```text
 C:\tmp\aichat\<IDEName>\<chatModelId>\
@@ -138,6 +139,10 @@ If a filename collision occurs, it appends either:
 - a numeric suffix
 
 to preserve all exports without overwriting.
+
+If `--file-dates` is enabled, output filenames are prefixed with the local conversation timestamp and a separator before sanitization. Use `--no-file-dates` to disable that.
+
+If a markdown file already exists for the same session UID under a different filename, the exporter renames the old file to the new filename before rewriting it. When `--git` is enabled and the file is tracked, that rename uses `git mv` from the per-IDE output directory.
 
 The per-IDE cache is a performance hint, not a source of truth. If it gets out of sync, delete it and rerun.
 
@@ -158,8 +163,18 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - If omitted, the script auto-discovers `aia-task-history` directories under `%APPDATA%\JetBrains\<IDE>\`.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
+- `--file-dates`
+  - Prefix output filenames with the local timestamp of each conversation.
+- `--no-file-dates`
+  - Disable filename timestamp prefixes.
 - `--no-disk-cache`
   - Disable reading and writing the on-disk `.aichat_export_cache.json` file.
+- `--git`
+  - Validate the output path as a git repository and use `git mv` for tracked renames.
+- `--git-bin`
+  - Optional git executable path or directory. Relative paths are resolved against the process CWD at startup.
+- `-q`, `--quiet`
+  - Suppress progress and summary output.
 
 The exporter keeps a per-IDE cache at:
 
@@ -179,8 +194,6 @@ That cache stores:
 - prompt-to-`aia-task-history` file lookups
 
 It is there to make repeat runs cheaper, especially the common "just grab the new conversations" workflow and reruns with `--ignore-existing`. If you manually move, delete, or edit exported markdown files outside the exporter, delete the cache file as well so the next run rebuilds it from disk. Use `--no-disk-cache` when you want the exporter to ignore the cache entirely for a run.
-- `-q`, `--quiet`
-  - Suppress progress and summary output.
 
 After writing each markdown file, the exporter also sets the file timestamp from `statisticInformation.timestamp`. On Windows, it attempts to set creation, modified, and accessed times; on other platforms, it sets modified and accessed times.
 

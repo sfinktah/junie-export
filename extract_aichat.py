@@ -4,6 +4,7 @@ import base64
 import argparse
 import os
 import platform
+import subprocess
 from datetime import datetime, timezone
 import html
 import json
@@ -26,6 +27,20 @@ EVENT_PROMPT_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionUserPromptEvent"
 EVENT_MESSAGE_BLOCK_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionMessageBlockEvent"
 EVENTS_FILE_SUFFIX = ".events"
 MARKDOWN_SUFFIX = ".md"
+DEFAULT_FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S - "
+SESSION_UID_RE = re.compile(
+    r"Session UID:\s*`?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`?",
+    re.IGNORECASE,
+)
+FILENAME_SAFE_RE = re.compile(r"[^\w .()-]+", re.UNICODE)
+WINDOWS_RESERVED_BASENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 @dataclass(frozen=True)
@@ -72,6 +87,22 @@ class IdeCache:
 
     def model_index(self, model_component: str) -> dict[str, str | None]:
         return self.model_output_uids.setdefault(model_component, {})
+
+
+@dataclass(frozen=True)
+class OutputPlan:
+    output_path: Path
+    rename_source: Path | None
+
+
+@dataclass(frozen=True)
+class ExportJob:
+    input_path: Path
+    session: ChatSession
+    recovered_turns: list[RecoveredTurn]
+    output_path: Path
+    rename_source: Path | None
+    existing_uids: dict[str, str | None]
 
 
 def iter_input_files(paths: list[Path]) -> Iterator[tuple[Path, str]]:
@@ -280,18 +311,124 @@ def save_ide_cache(cache: IdeCache, use_disk_cache: bool = True) -> None:
     cache.dirty = False
 
 
-def ensure_model_uid_index(cache: IdeCache, model_dir: Path, model_component: str) -> dict[str, str | None]:
-    existing = cache.model_output_uids.get(model_component)
-    if existing is not None:
-        return existing
+def resolve_git_executable(git_bin: str | None, start_cwd: Path) -> str:
+    if not git_bin:
+        return "git"
 
-    existing = {}
+    candidate = Path(git_bin)
+    if candidate.is_absolute():
+        resolved = candidate
+    elif any(sep in git_bin for sep in (os.sep, os.altsep) if sep) or git_bin.startswith("."):
+        resolved = (start_cwd / candidate).resolve()
+    else:
+        return git_bin
+
+    if resolved.is_dir():
+        return str(resolved / ("git.exe" if platform.system() == "Windows" else "git"))
+
+    return str(resolved)
+
+
+def run_git(args: list[str], cwd: Path, git_executable: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [git_executable, *args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git_root(start: Path, git_executable: str) -> Path | None:
+    result = run_git(["rev-parse", "--show-toplevel"], start, git_executable)
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def tracked_paths(repo: Path, paths: Iterable[Path], git_executable: str) -> set[Path]:
+    rels: list[str] = []
+    for path in paths:
+        try:
+            rels.append(str(path.resolve().relative_to(repo)))
+        except ValueError:
+            pass
+
+    if not rels:
+        return set()
+
+    result = subprocess.run(
+        [git_executable, "ls-files", "-z", "--", *rels],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="ignore").strip())
+
+    return {repo / Path(item.decode("utf-8", errors="ignore")) for item in result.stdout.split(b"\0") if item}
+
+
+def rename_many(rename_pairs: Iterable[tuple[Path, Path]], cwd: Path, git_executable: str, use_git: bool) -> None:
+    pairs: list[tuple[Path, Path]] = [(Path(src).resolve(), Path(dst).resolve()) for src, dst in rename_pairs]
+    if not pairs:
+        return
+
+    if use_git:
+        repo = git_root(cwd, git_executable)
+        if repo is None:
+            raise RuntimeError(f"{cwd} is not inside a git repository")
+
+        tracked = tracked_paths(cwd, (src for src, _ in pairs), git_executable)
+        for src, dst in pairs:
+            if not src.exists():
+                raise FileNotFoundError(src)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                src_rel = src.relative_to(cwd)
+                dst_rel = dst.relative_to(cwd)
+            except ValueError:
+                src.rename(dst)
+                continue
+
+            if src in tracked:
+                result = run_git(["mv", "--", str(src_rel), str(dst_rel)], cwd, git_executable)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip())
+            else:
+                src.rename(dst)
+            if not dst.exists():
+                raise RuntimeError(f"rename completed but destination is missing: {dst}")
+        return
+
+    for src, dst in pairs:
+        if not src.exists():
+            raise FileNotFoundError(src)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        if not dst.exists():
+            raise RuntimeError(f"rename completed but destination is missing: {dst}")
+
+
+def ensure_model_uid_index(cache: IdeCache, model_dir: Path, model_component: str) -> dict[str, str | None]:
+    existing = dict(cache.model_output_uids.get(model_component, {}))
+    on_disk: dict[str, str | None] = {}
     if model_dir.is_dir():
         for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
             if md_path.is_file():
-                existing[md_path.name] = read_session_uid_from_markdown(md_path)
+                uid = read_session_uid_from_markdown(md_path)
+                on_disk[md_path.name] = uid
+
+    if existing != on_disk:
+        existing = on_disk
+        cache.model_output_uids[model_component] = existing
+        cache.dirty = True
+        return existing
+
     cache.model_output_uids[model_component] = existing
-    cache.dirty = True
     return existing
 
 
@@ -326,23 +463,7 @@ def summarize_block(event: dict) -> str | None:
         command = event.get("command") or ""
         status = event.get("status") or ""
         details = event.get("details") or ""
-        if command and ("\n" in command or "`" in command):
-            lines = ["Terminal:"]
-            lines.append("```")
-            lines.extend(command.splitlines() or [""])
-            lines.append("```")
-            if status:
-                lines.append(f"status={status}")
-            if details:
-                lines.append(details)
-            return "\n".join(lines)
-
-        parts = [f"Terminal: `{command}`" if command else "Terminal"]
-        if status:
-            parts.append(f"status={status}")
-        if details:
-            parts.append(details)
-        return " - ".join(parts)
+        return render_terminal_block(command, status, details)
 
     if kind == "com.intellij.ml.llm.aui.events.api.AgentThoughtBlockUpdatedEvent":
         text = (event.get("text") or "").strip()
@@ -399,6 +520,20 @@ def summarize_block(event: dict) -> str | None:
     return None
 
 
+def render_terminal_block(command: str, status: str, details: str) -> str:
+    heading = "Terminal"
+    if status:
+        heading = f"Terminal ({status})"
+
+    lines = [f"{heading}:"]
+    lines.append("```powershell")
+    lines.extend(command.splitlines() or [""])
+    lines.append("```")
+    if details.strip():
+        lines.append(details.strip())
+    return "\n".join(lines)
+
+
 def build_turn_summaries(events_path: Path) -> list[RecoveredTurn]:
     turns: list[RecoveredTurn] = []
     current_prompt: str | None = None
@@ -441,18 +576,48 @@ def iter_task_history_roots(task_history_root: Path | None) -> Iterator[Path]:
             yield candidate
 
 
-def sanitize_filename(title: str) -> str:
-    cleaned = html.unescape(title).strip()
-    cleaned = re.sub(r'[<>:"/\\\\|?*]+', "_", cleaned)
+def format_local_timestamp(timestamp_ms: int | None) -> str | None:
+    if timestamp_ms is None:
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sanitize_filename_component(value: str) -> str:
+    cleaned = html.unescape(value).strip()
+    cleaned = FILENAME_SAFE_RE.sub("_", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        return "unknown"
+    stem = cleaned.split(".", 1)[0].upper()
+    if stem in WINDOWS_RESERVED_BASENAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def sanitize_filename(title: str) -> str:
+    cleaned = sanitize_filename_component(title)
     return cleaned or "untitled-chat"
 
 
 def sanitize_path_component(value: str) -> str:
-    cleaned = html.unescape(value).strip()
-    cleaned = re.sub(r'[<>:"/\\\\|?*]+', "_", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    return cleaned or "unknown"
+    return sanitize_filename_component(value)
+
+
+def preprocess_output_title(title: str) -> str:
+    cleaned = html.unescape(title).strip()
+    cleaned = cleaned.replace("*", "").replace("?", "")
+    if cleaned.startswith("_"):
+        cleaned = cleaned[1:]
+        if cleaned.startswith("_"):
+            cleaned = cleaned[1:]
+    return cleaned
+
+
+def extract_session_uid(text: str) -> str | None:
+    match = SESSION_UID_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    return None
 
 
 def read_session_uid_from_markdown(path: Path) -> str | None:
@@ -460,30 +625,73 @@ def read_session_uid_from_markdown(path: Path) -> str | None:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return None
+    return extract_session_uid(text)
 
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith(SESSION_UID_PREFIX) and line.endswith("`"):
-            return line[len(SESSION_UID_PREFIX) : -1]
+
+def format_file_date_prefix(timestamp_ms: int | None) -> str:
+    stamp = format_local_timestamp(timestamp_ms)
+    if not stamp:
+        return ""
+    return f"{stamp} - "
+
+
+def build_output_stem(title: str, timestamp_ms: int | None, file_dates: bool) -> str:
+    prefix = format_file_date_prefix(timestamp_ms) if file_dates else ""
+    return sanitize_filename(f"{prefix}{preprocess_output_title(title)}")
+
+
+def find_existing_output_path(model_dir: Path, existing_uids: dict[str, str | None], session_uid: str | None) -> Path | None:
+    if session_uid is None:
+        return None
+    for name, existing_uid in existing_uids.items():
+        if existing_uid == session_uid:
+            return model_dir / name
     return None
 
 
-def has_existing_output_with_uid(
+def has_existing_output_with_uid(existing_uids: dict[str, str | None], session_uid: str | None) -> bool:
+    if session_uid is None:
+        return False
+    return any(existing_uid == session_uid for existing_uid in existing_uids.values())
+
+
+def plan_output_path(
+    model_dir: Path,
     title: str,
+    timestamp_ms: int | None,
     session_uid: str | None,
+    ignore_existing: bool,
+    used: set[Path],
     existing_uids: dict[str, str | None],
-) -> bool:
-    base = sanitize_filename(title)
+    file_dates: bool,
+) -> OutputPlan | None:
+    base = build_output_stem(title, timestamp_ms, file_dates)
+    existing_same_uid = find_existing_output_path(model_dir, existing_uids, session_uid)
     counter = 0
+
     while True:
         suffix = "" if counter == 0 else f"_{counter}"
-        candidate_name = f"{base}{suffix}{MARKDOWN_SUFFIX}"
-        if candidate_name not in existing_uids:
-            return False
-        existing_uid = existing_uids[candidate_name]
-        if existing_uid is not None and existing_uid == session_uid:
-            return True
-        counter += 1
+        candidate = model_dir / f"{base}{suffix}{MARKDOWN_SUFFIX}"
+        if candidate in used:
+            counter += 1
+            continue
+
+        if candidate.name in existing_uids:
+            existing_uid = existing_uids[candidate.name]
+            if existing_uid is not None and existing_uid == session_uid:
+                if ignore_existing:
+                    return None
+                used.add(candidate)
+                return OutputPlan(output_path=candidate, rename_source=None)
+            counter += 1
+            continue
+
+        if existing_same_uid is not None and existing_same_uid != candidate:
+            used.add(candidate)
+            return OutputPlan(output_path=candidate, rename_source=existing_same_uid)
+
+        used.add(candidate)
+        return OutputPlan(output_path=candidate, rename_source=None)
 
 
 def quote_block(text: str) -> str:
@@ -543,38 +751,44 @@ def format_message(message: ChatMessage) -> str:
 
 
 def render_session(session: ChatSession, source_name: str, recovered_turns: list[RecoveredTurn]) -> str:
-    lines: list[str] = [f"# {session.title}", "", f"Source: `{source_name}`"]
+    header_lines: list[str] = [f"# {session.title}", ""]
+    info_lines = [f"Source: `{source_name}`"]
     if session.uid:
-        lines.append(f"Session UID: `{session.uid}`")
-    lines.append(f"chatModelId: `{session.model_id}`")
+        info_lines.append(f"Session UID: `{session.uid}`")
+    info_lines.append(f"chatModelId: `{session.model_id}`")
     if session.source_action_type:
-        lines.append(f"sourceActionType: `{session.source_action_type}`")
+        info_lines.append(f"sourceActionType: `{session.source_action_type}`")
     if session.timestamp_ms is not None:
-        lines.append(f"Date: `{datetime.fromtimestamp(session.timestamp_ms / 1000, tz=timezone.utc).isoformat()}`")
+        info_lines.append(f"Date: `{format_local_timestamp(session.timestamp_ms)}`")
         if session.modified_at_ms is not None and session.modified_at_ms != session.timestamp_ms:
-            lines.append(f"Modified at: `{datetime.fromtimestamp(session.modified_at_ms / 1000, tz=timezone.utc).isoformat()}`")
-    lines.append("")
+            info_lines.append(f"Modified at: `{format_local_timestamp(session.modified_at_ms)}`")
+
+    for index, info_line in enumerate(info_lines):
+        header_lines.append(info_line)
+        if index != len(info_lines) - 1:
+            header_lines.append("")
+    header_lines.append("")
 
     assistant_turn_index = 0
     for index, message in enumerate(session.messages, start=1):
         if index > 1:
-            lines.append("")
+            header_lines.append("")
         body = message.display_content
         if message.author == "Assistant" and not body.strip() and assistant_turn_index < len(recovered_turns):
             recovered = recovered_turns[assistant_turn_index].to_markdown()
             if recovered.strip():
                 body = recovered
         if message.author == "Assistant" and body.startswith("- "):
-            lines.append("Assistant did:")
-            lines.append("")
-            lines.append(body)
+            header_lines.append("Assistant did:")
+            header_lines.append("")
+            header_lines.append(body)
         else:
-            lines.append(format_message(ChatMessage(message.author, body, message.internal_content)))
+            header_lines.append(format_message(ChatMessage(message.author, body, message.internal_content)))
         if message.author == "Assistant":
             assistant_turn_index += 1
 
-    lines.append("")
-    return "\n".join(lines)
+    header_lines.append("")
+    return "\n".join(header_lines)
 
 
 def set_file_timestamp(path: str, timestamp_ms: int) -> None:
@@ -680,13 +894,22 @@ def resolve_output_path(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract JetBrains AI Chat / Junie sessions from workspace XML files.")
+    parser = argparse.ArgumentParser(
+        description="Extract JetBrains AI Chat / Junie sessions from workspace XML files.",
+        add_help=False,
+    )
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="Show this help message and exit.",
+    )
     parser.add_argument(
         "paths",
         nargs="*",
         type=Path,
         default=[],
-        help="Workspace XML file(s) or a directory containing workspace XML files. If omitted, scans %APPDATA%\\JetBrains\\*\\workspace\\*.xml and keeps only files containing ChatSessionStateTemp.",
+        help="Workspace XML file(s) or a directory containing workspace XML files. If omitted, scans %%APPDATA%%\\JetBrains\\*\\workspace\\*.xml and keeps only files containing ChatSessionStateTemp.",
     )
     parser.add_argument(
         "--output-dir",
@@ -705,10 +928,35 @@ def main() -> int:
         action="store_true",
         help="Skip writing a file when an existing export has the same session UID.",
     )
+    file_dates_group = parser.add_mutually_exclusive_group()
+    file_dates_group.add_argument(
+        "--file-dates",
+        dest="file_dates",
+        action="store_true",
+        default=True,
+        help="Prefix output filenames with the local timestamp of each conversation.",
+    )
+    file_dates_group.add_argument(
+        "--no-file-dates",
+        dest="file_dates",
+        action="store_false",
+        help="Do not prefix output filenames with timestamps.",
+    )
     parser.add_argument(
         "--no-disk-cache",
         action="store_true",
         help="Disable reading and writing the on-disk .aichat_export_cache.json file.",
+    )
+    parser.add_argument(
+        "--git",
+        action="store_true",
+        help="Use git mv for tracked file renames and validate that each IDE output directory is inside a git repository.",
+    )
+    parser.add_argument(
+        "--git-bin",
+        type=str,
+        default=None,
+        help="Optional git executable path or directory. Relative paths are resolved against the process CWD at startup.",
     )
     parser.add_argument(
         "-q",
@@ -720,6 +968,16 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    git_executable = resolve_git_executable(args.git_bin, Path.cwd())
+    if args.git:
+        try:
+            git_version = run_git(["--version"], Path.cwd(), git_executable)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+        if git_version.returncode != 0:
+            message = git_version.stderr.strip() or git_version.stdout.strip() or "unable to run git"
+            raise SystemExit(message)
+
     sessions_written = 0
     used_paths: set[Path] = set()
     recovered_by_model: Counter[str] = Counter()
@@ -727,16 +985,63 @@ def main() -> int:
     flatten_ide_output = should_flatten_output(args.paths)
     current_ide_name: str | None = None
     current_ide_cache: IdeCache | None = None
+    current_ide_repo_root: Path | None = None
+    current_ide_jobs: list[ExportJob] = []
+    current_ide_rename_ops: list[tuple[Path, Path, dict[str, str | None]]] = []
     current_ide_recovered = 0
     current_ide_written = 0
     current_ide_recovered_by_model: Counter[str] = Counter()
     current_ide_written_by_model: Counter[str] = Counter()
 
-    def flush_current_ide_summary() -> None:
-        nonlocal current_ide_name, current_ide_cache, current_ide_recovered, current_ide_written
+    def flush_current_ide_state() -> None:
+        nonlocal current_ide_name, current_ide_cache, current_ide_repo_root
+        nonlocal current_ide_jobs, current_ide_rename_ops
+        nonlocal current_ide_recovered, current_ide_written
         nonlocal current_ide_recovered_by_model, current_ide_written_by_model
+        nonlocal sessions_written
+        if current_ide_cache is not None and current_ide_rename_ops:
+            for src, dst, existing_uids in current_ide_rename_ops:
+                rename_many(
+                    [(src, dst)],
+                    current_ide_cache.cache_root,
+                    git_executable,
+                    use_git=args.git,
+                )
+                if not dst.exists():
+                    raise RuntimeError(f"rename completed but destination is missing: {dst}")
+                old_uid = existing_uids.pop(src.name, None)
+                existing_uids[dst.name] = old_uid
+                current_ide_cache.dirty = True
+
+        if current_ide_cache is not None and current_ide_jobs:
+            for job in current_ide_jobs:
+                job.output_path.write_text(
+                    render_session(job.session, source_name=str(job.input_path), recovered_turns=job.recovered_turns),
+                    encoding="utf-8",
+                )
+                if not job.output_path.exists():
+                    raise RuntimeError(f"write completed but destination is missing: {job.output_path}")
+                if job.session.timestamp_ms is not None:
+                    try:
+                        set_file_timestamp(str(job.output_path), job.session.timestamp_ms)
+                    except OSError:
+                        pass
+                job.existing_uids[job.output_path.name] = job.session.uid
+                current_ide_cache.dirty = True
+                written_by_model[job.session.model_id] += 1
+                current_ide_written_by_model[job.session.model_id] += 1
+                current_ide_written += 1
+                sessions_written += 1
+
         if current_ide_cache is not None:
             save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
+
+        if current_ide_cache is not None:
+            current_ide_cache = None
+        current_ide_repo_root = None
+        current_ide_jobs = []
+        current_ide_rename_ops = []
+
         if current_ide_name is None or args.quiet:
             return
         if current_ide_recovered == 0:
@@ -759,76 +1064,82 @@ def main() -> int:
     else:
         input_items = iter_default_workspace_files()
 
-    for input_path, ide_name in input_items:
-        if ide_name != current_ide_name:
-            flush_current_ide_summary()
-            current_ide_name = ide_name
-            current_ide_cache = load_ide_cache(
-                cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
-                use_disk_cache=not args.no_disk_cache,
-            )
-            current_ide_recovered = 0
-            current_ide_written = 0
-            current_ide_recovered_by_model = Counter()
-            current_ide_written_by_model = Counter()
-            if not args.quiet:
-                print(f"Processing IDE: {ide_name}", flush=True)
-        sessions = extract_chat_sessions(input_path)
-        if current_ide_cache is None:
-            current_ide_cache = load_ide_cache(
-                cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
-                use_disk_cache=not args.no_disk_cache,
-            )
-        for session in sessions:
-            model_component = sanitize_path_component(session.model_id)
-            if flatten_ide_output:
-                model_dir = args.output_dir / model_component
-            else:
-                model_dir = current_ide_cache.cache_root / model_component
+    try:
+        for input_path, ide_name in input_items:
+            if ide_name != current_ide_name:
+                flush_current_ide_state()
+                current_ide_name = ide_name
+                current_ide_cache = load_ide_cache(
+                    cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
+                    use_disk_cache=not args.no_disk_cache,
+                )
+                if args.git:
+                    current_ide_repo_root = git_root(current_ide_cache.cache_root, git_executable)
+                    if current_ide_repo_root is None:
+                        raise SystemExit(f"{current_ide_cache.cache_root} is not inside a git repository")
+                current_ide_recovered = 0
+                current_ide_written = 0
+                current_ide_recovered_by_model = Counter()
+                current_ide_written_by_model = Counter()
+                current_ide_jobs = []
+                current_ide_rename_ops = []
+                if not args.quiet:
+                    print(f"Processing IDE: {ide_name}", flush=True)
+            sessions = extract_chat_sessions(input_path)
+            for session in sessions:
+                model_component = sanitize_path_component(session.model_id)
+                if flatten_ide_output:
+                    model_dir = args.output_dir / model_component
+                else:
+                    model_dir = current_ide_cache.cache_root / model_component
 
-            existing_uids = ensure_model_uid_index(current_ide_cache, model_dir, model_component)
+                existing_uids = ensure_model_uid_index(current_ide_cache, model_dir, model_component)
 
-            if args.ignore_existing and session.model_id.startswith("agent_"):
-                if has_existing_output_with_uid(session.title, session.uid, existing_uids):
+                if args.ignore_existing and session.model_id.startswith("agent_"):
+                    if has_existing_output_with_uid(existing_uids, session.uid):
+                        continue
+
+                recovered_turns = recover_junie_turns(session, args.task_history_root, current_ide_cache)
+                if not has_assistant_content(session) and not recovered_turns:
                     continue
 
-            recovered_turns = recover_junie_turns(session, args.task_history_root, current_ide_cache)
-            if not has_assistant_content(session) and not recovered_turns:
-                continue
+                plan = plan_output_path(
+                    model_dir,
+                    session.title,
+                    session.timestamp_ms,
+                    session.uid,
+                    args.ignore_existing,
+                    used_paths,
+                    existing_uids,
+                    args.file_dates,
+                )
+                if plan is None:
+                    continue
+                recovered_by_model[session.model_id] += 1
+                current_ide_recovered += 1
+                current_ide_recovered_by_model[session.model_id] += 1
+                model_dir.mkdir(parents=True, exist_ok=True)
+                if plan.rename_source is not None and plan.rename_source != plan.output_path:
+                    current_ide_rename_ops.append((plan.rename_source, plan.output_path, existing_uids))
+                current_ide_jobs.append(
+                    ExportJob(
+                        input_path=input_path,
+                        session=session,
+                        recovered_turns=recovered_turns,
+                        output_path=plan.output_path,
+                        rename_source=plan.rename_source,
+                        existing_uids=existing_uids,
+                    )
+                )
 
-            recovered_by_model[session.model_id] += 1
-            current_ide_recovered += 1
-            current_ide_recovered_by_model[session.model_id] += 1
-            model_dir.mkdir(parents=True, exist_ok=True)
-            output_path = resolve_output_path(
-                model_dir,
-                session.title,
-                session.uid,
-                args.ignore_existing,
-                used_paths,
-                existing_uids,
-            )
-            if output_path is None:
-                continue
-            output_path.write_text(
-                render_session(session, source_name=str(input_path), recovered_turns=recovered_turns),
-                encoding="utf-8",
-            )
-            existing_uids[output_path.name] = session.uid
-            current_ide_cache.dirty = True
-            if session.timestamp_ms is not None:
-                try:
-                    set_file_timestamp(str(output_path), session.timestamp_ms)
-                except OSError:
-                    pass
-            written_by_model[session.model_id] += 1
-            current_ide_written_by_model[session.model_id] += 1
-            current_ide_written += 1
-            sessions_written += 1
-
-    flush_current_ide_summary()
-    if current_ide_cache is not None:
-        save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
+        flush_current_ide_state()
+    except Exception:
+        if current_ide_cache is not None and current_ide_cache.dirty:
+            try:
+                save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
+            except Exception:
+                pass
+        raise
 
     if not args.quiet:
         print(f"Grand total: Wrote {sessions_written} chat markdown file(s) to {args.output_dir}", flush=True)
