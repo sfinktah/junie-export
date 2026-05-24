@@ -18,8 +18,129 @@ from typing import Iterable, Iterator
 from xml.etree import ElementTree as ET
 
 
-DEFAULT_INPUT = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roaming")) / "JetBrains" / "*" / "workspace" / "*.xml"
-DEFAULT_OUTPUT_DIR = Path(r"C:\tmp\aichat")
+def windows_roaming_appdata() -> Path:
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata)
+        return Path.home() / "AppData" / "Roaming"
+    return Path.home()
+
+
+def is_wsl() -> bool:
+    if platform.system() != "Linux":
+        return False
+
+    release = platform.release().lower()
+    return (
+        "microsoft" in release
+        or "wsl" in release
+        or "WSL_DISTRO_NAME" in os.environ
+        or "WSL_INTEROP" in os.environ
+        or "WSLENV" in os.environ
+    )
+
+
+def windows_appdata_via_cmd() -> Path | None:
+    if not is_wsl():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["cmd.exe", "/c", "echo", "%APPDATA%"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+    appdata = result.stdout.strip()
+    if not appdata or "%" in appdata:
+        return None
+
+    match = re.match(r"^([A-Za-z]):[\\/](.*)$", appdata)
+    if not match:
+        return None
+
+    drive = match.group(1).lower()
+    rest = match.group(2).replace("\\", "/")
+    return Path(f"/mnt/{drive}/{rest}")
+
+
+def get_windows_home_from_wsl() -> Path | None:
+    if not is_wsl():
+        return None
+
+    appdata = windows_appdata_via_cmd()
+    if appdata is not None:
+        home = appdata.parent.parent
+        if home.exists():
+            return home
+
+    win_user = os.environ.get("USER")
+    if not win_user:
+        return None
+
+    candidate = Path("/mnt/c/Users") / win_user
+    return candidate if candidate.exists() else None
+
+
+def get_windows_appdata_from_wsl() -> Path | None:
+    if not is_wsl():
+        return None
+
+    appdata = windows_appdata_via_cmd()
+    if appdata is not None and appdata.exists():
+        return appdata
+
+    win_home = get_windows_home_from_wsl()
+    if not win_home:
+        return None
+
+    appdata = win_home / "AppData" / "Roaming"
+    return appdata if appdata.exists() else None
+
+
+def jetbrains_workspace_globs() -> list[Path]:
+    home = Path.home()
+    system = platform.system()
+    globs: list[Path] = []
+
+    if system == "Windows":
+        return [windows_roaming_appdata() / "JetBrains" / "*" / "workspace" / "*.xml"]
+
+    if system == "Linux":
+        globs.extend(
+            [
+            home / ".config" / "JetBrains" / "*" / "workspace" / "*.xml",
+            home / ".*" / "config" / "workspace" / "*.xml",
+            ]
+        )
+        if is_wsl():
+            win_appdata = get_windows_appdata_from_wsl()
+            if win_appdata is not None:
+                globs.append(win_appdata / "JetBrains" / "*" / "workspace" / "*.xml")
+        return globs
+
+    if system == "Darwin":
+        return [
+            home / "Library" / "Application Support" / "JetBrains" / "*" / "workspace" / "*.xml",
+            home / "Library" / "Preferences" / "*" / "workspace" / "*.xml",
+        ]
+
+    return []
+
+
+def default_workspace_input() -> Path:
+    globs = jetbrains_workspace_globs()
+    if globs:
+        return globs[0]
+    return Path("**/.idea/workspace.xml")
+
+
+DEFAULT_INPUT = default_workspace_input()
+DEFAULT_OUTPUT_DIR = Path(r"C:\tmp\aichat") if platform.system() == "Windows" else Path("/tmp/aichat")
 CHAT_SESSION_MARKER = '<component name="ChatSessionStateTemp">'
 SESSION_UID_PREFIX = "Session UID: `"
 IDE_CACHE_FILENAME = ".aichat_export_cache.json"
@@ -48,6 +169,66 @@ WINDOWS_RESERVED_BASENAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+
+def ide_name_from_workspace_path(path: Path) -> str:
+    if path.parent.name == ".idea":
+        return path.parent.parent.name
+    if path.parent.name == "workspace" and path.parent.parent.name == "config":
+        return path.parent.parent.parent.name
+    if path.parent.name == "workspace":
+        return path.parent.parent.name
+    return path.parent.name
+
+
+def iter_jetbrains_ide_dirs() -> Iterator[Path]:
+    seen: set[Path] = set()
+    system = platform.system()
+    home = Path.home()
+
+    def add_root(root: Path) -> Iterator[Path]:
+        if not root.is_dir():
+            return
+        for ide_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+            resolved = ide_dir.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield ide_dir
+
+    if system == "Windows":
+        yield from add_root(windows_roaming_appdata() / "JetBrains")
+        return
+
+    if system == "Linux":
+        yield from add_root(home / ".config" / "JetBrains")
+        for hidden_dir in sorted(p for p in home.iterdir() if p.is_dir() and p.name.startswith(".")):
+            if (hidden_dir / "config" / "workspace").is_dir() or (hidden_dir / "aia-task-history").is_dir():
+                resolved = hidden_dir.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    yield hidden_dir
+        if is_wsl():
+            win_appdata = get_windows_appdata_from_wsl()
+            if win_appdata is not None:
+                yield from add_root(win_appdata / "JetBrains")
+        return
+
+    if system == "Darwin":
+        yield from add_root(home / "Library" / "Application Support" / "JetBrains")
+        yield from add_root(home / "Library" / "Preferences")
+
+
+def iter_workspace_files_from_ide_dir(ide_dir: Path) -> Iterator[Path]:
+    workspace_dir = ide_dir / "workspace"
+    if not workspace_dir.is_dir():
+        workspace_dir = ide_dir / "config" / "workspace"
+    if not workspace_dir.is_dir():
+        return
+
+    for xml_path in sorted(workspace_dir.glob("*.xml")):
+        if xml_path.is_file():
+            yield xml_path
 
 
 @dataclass(frozen=True)
@@ -133,11 +314,11 @@ def iter_input_files(paths: list[Path]) -> Iterator[tuple[Path, str]]:
             for xml_path in sorted(path.rglob("*.xml")):
                 if xml_path not in seen:
                     seen.add(xml_path)
-                    yield xml_path, xml_path.parent.parent.name
+                    yield xml_path, ide_name_from_workspace_path(xml_path)
         elif path.is_file():
             if path not in seen:
                 seen.add(path)
-                yield path, path.parent.parent.name if path.parent.name == "workspace" else path.parent.name
+                yield path, ide_name_from_workspace_path(path)
         else:
             raise FileNotFoundError(path)
 
@@ -152,21 +333,23 @@ def should_flatten_output(paths: list[Path]) -> bool:
 
     resolved = path.resolve()
     if resolved.is_file():
-        return resolved.parent.name == "workspace"
+        return resolved.parent.name in {"workspace", ".idea"}
 
     if not resolved.is_dir():
         return False
 
-    jetbrains_root = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roaming")) / "JetBrains"
-    try:
-        relative = resolved.relative_to(jetbrains_root)
-    except ValueError:
-        return False
+    for ide_dir in iter_jetbrains_ide_dirs():
+        try:
+            relative = resolved.relative_to(ide_dir.resolve())
+        except ValueError:
+            continue
 
-    if len(relative.parts) == 1:
-        return True
+        if len(relative.parts) == 1:
+            return True
 
-    return len(relative.parts) >= 2 and relative.parts[1] == "workspace"
+        return len(relative.parts) >= 2 and relative.parts[1] in {"workspace", "config"}
+
+    return False
 
 
 def workspace_file_has_chat_marker(xml_path: Path) -> bool:
@@ -233,23 +416,27 @@ def build_task_history_index(
 
 
 def iter_default_workspace_files(verbose: bool = False) -> Iterator[tuple[Path, str]]:
-    jetbrains_root = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roaming")) / "JetBrains"
-    if not jetbrains_root.exists():
-        return
-
-    verbose_print(verbose, 4, f"start scanning workspaces: {jetbrains_root}")
+    verbose_print(verbose, 4, "start scanning workspaces: JetBrains roots")
+    seen: set[Path] = set()
     try:
-        for ide_dir in sorted(p for p in jetbrains_root.iterdir() if p.is_dir()):
-            workspace_dir = ide_dir / "workspace"
-            if not workspace_dir.is_dir():
-                continue
-            for xml_path in sorted(workspace_dir.glob("*.xml")):
-                if not xml_path.is_file():
+        for ide_dir in iter_jetbrains_ide_dirs():
+            for xml_path in iter_workspace_files_from_ide_dir(ide_dir):
+                resolved = xml_path.resolve()
+                if resolved in seen:
                     continue
+                seen.add(resolved)
                 if workspace_file_has_chat_marker(xml_path):
-                    yield xml_path, ide_dir.name
+                    yield xml_path, ide_name_from_workspace_path(xml_path)
+
+        for xml_path in sorted(Path.cwd().glob("**/.idea/workspace.xml")):
+            resolved = xml_path.resolve()
+            if resolved in seen or not xml_path.is_file():
+                continue
+            seen.add(resolved)
+            if workspace_file_has_chat_marker(xml_path):
+                yield xml_path, ide_name_from_workspace_path(xml_path)
     finally:
-        verbose_print(verbose, 4, f"end scanning workspaces: {jetbrains_root}")
+        verbose_print(verbose, 4, "end scanning workspaces: JetBrains roots")
 
 
 def get_option_value(node: ET.Element, option_name: str) -> str | None:
@@ -749,11 +936,7 @@ def iter_task_history_roots(task_history_root: Path | None) -> Iterator[Path]:
             yield task_history_root
         return
 
-    jetbrains_root = Path(os.environ.get("APPDATA", r"C:\Users\sfinktah\AppData\Roaming")) / "JetBrains"
-    if not jetbrains_root.exists():
-        return
-
-    for ide_dir in sorted(p for p in jetbrains_root.iterdir() if p.is_dir()):
+    for ide_dir in iter_jetbrains_ide_dirs():
         candidate = ide_dir / "aia-task-history"
         if candidate.is_dir():
             yield candidate
@@ -1116,7 +1299,7 @@ def main() -> int:
         nargs="*",
         type=Path,
         default=[],
-        help="Workspace XML file(s) or a directory containing workspace XML files. If omitted, scans %%APPDATA%%\\JetBrains\\*\\workspace\\*.xml and keeps only files containing ChatSessionStateTemp.",
+        help="Workspace XML file(s) or a directory containing workspace XML files. If omitted, scans platform-specific JetBrains workspace locations and project-local .idea/workspace.xml files, then keeps only files containing ChatSessionStateTemp.",
     )
     parser.add_argument(
         "--output-dir",

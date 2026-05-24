@@ -1,6 +1,6 @@
 # JetBrains AI Chat Exporter
 
-`extract_aichat.py` scans JetBrains workspace XML files under `%APPDATA%\JetBrains\*\workspace\*.xml`, extracts `SerializedChat` sessions, and writes each chat to markdown under an output directory you choose.
+`extract_aichat.py` scans JetBrains workspace XML files across the platform-specific JetBrains config locations, extracts `SerializedChat` sessions, and writes each chat to markdown under an output directory you choose.
 
 It handles two sources of content:
 
@@ -15,7 +15,7 @@ The output is grouped by IDE name and `chatModelId`, so the final path shape is:
 
 If you pass exactly one explicit IDE root or workspace file, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`.
 
-The default output directory is `C:\tmp\aichat\`, but you can point it anywhere. If you want the exported AI history to live with the project, use a directory inside the repository. That makes later searching and diffing much easier.
+The default output directory is `C:\tmp\aichat\` on Windows and `/tmp/aichat` on Unix-like systems, but you can point it anywhere. If you want the exported AI history to live with the project, use a directory inside the repository. That makes later searching and diffing much easier.
 
 ## What It Exports
 
@@ -44,8 +44,13 @@ The default output directory is `C:\tmp\aichat\`, but you can point it anywhere.
 When no explicit paths are provided, the script walks:
 
 ```text
-%APPDATA%\JetBrains\<IDE>\workspace\*.xml
+Windows: %APPDATA%\JetBrains\<IDE>\workspace\*.xml
+Linux:   ~/.config/JetBrains/<IDE>/workspace/*.xml
+macOS:   ~/Library/Application Support/JetBrains/<IDE>/workspace/*.xml
+WSL:     /mnt/c/Users/<WindowsUser>/AppData/Roaming/JetBrains/<IDE>/workspace/*.xml
 ```
+
+When running inside WSL, the exporter scans both the native Linux JetBrains locations and the mounted Windows locations discovered through `%APPDATA%`.
 
 Each XML file is read as text first and only parsed if it contains:
 
@@ -127,6 +132,12 @@ Paths are sanitized for Windows and Unix compatibility. The exporter creates:
 C:\tmp\aichat\<IDEName>\<chatModelId>\
 ```
 
+On Unix-like systems, the equivalent default output path is:
+
+```text
+/tmp/aichat/<IDEName>/<chatModelId>/
+```
+
 If you pass exactly one explicit IDE root or workspace file, it instead writes to:
 
 ```text
@@ -152,7 +163,7 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
 
 - `paths`
   - Optional explicit XML files or directories to scan.
-  - If omitted, the script scans `%APPDATA%\JetBrains\*\workspace\*.xml` automatically.
+  - If omitted, the script scans platform-specific JetBrains workspace locations automatically, including WSL-mounted Windows paths when running under WSL.
 - `--output-dir`
   - Base directory for markdown exports.
   - By default the script creates `<output-dir>\<IDEName>\<chatModelId>\` underneath it.
@@ -160,7 +171,7 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - This can be a project-local directory if you want the AI history stored alongside the code.
 - `--task-history-root`
   - Optional root directory containing JetBrains `aia-task-history` files for recovery.
-  - If omitted, the script auto-discovers `aia-task-history` directories under `%APPDATA%\JetBrains\<IDE>\`.
+  - If omitted, the script auto-discovers `aia-task-history` directories under the relevant JetBrains roots for the current platform, including mounted Windows paths under WSL.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
 - `--file-dates`
@@ -212,7 +223,7 @@ python .\aichat_export\extract_aichat.py
 To export a specific workspace file or directory:
 
 ```powershell
-python .\aichat_export\extract_aichat.py C:\Users\sfinktah\AppData\Roaming\JetBrains\PhpStorm2026.1\workspace\2W9cqLpuxpUxyNVO6Pi0AKhtraW.xml
+python .\aichat_export\extract_aichat.py C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\workspace\2W9cqLpuxpUxyNVO6Pi0AKhtraW.xml
 ```
 
 To override the output directory:
@@ -224,7 +235,7 @@ python .\aichat_export\extract_aichat.py --output-dir C:\tmp\aichat_export
 To point at a different task-history root:
 
 ```powershell
-python .\aichat_export\extract_aichat.py --task-history-root C:\Users\sfinktah\AppData\Roaming\JetBrains\PhpStorm2026.1\aia-task-history
+python .\aichat_export\extract_aichat.py --task-history-root C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\aia-task-history
 ```
 
 To preserve existing exports when the same session UID already exists:
