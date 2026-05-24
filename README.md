@@ -244,6 +244,12 @@ To preserve existing exports when the same session UID already exists:
 python .\aichat_export\extract_aichat.py --ignore-existing
 ```
 
+To export one IDE from a WSL-mounted Windows JetBrains workspace path:
+
+```powershell
+python extract_aichat.py --ignore-existing --output-dir ../markle/aichat-history/PhpStorm2026.1 /mnt/c/Users/sfinktah/AppData/Roaming/JetBrains/PhpStorm2026.1/workspace/*.xml
+```
+
 ## File Collision Rules
 
 The exporter never overwrites a file that already belongs to a different session UID.
