@@ -181,6 +181,14 @@ def ide_name_from_workspace_path(path: Path) -> str:
     return path.parent.name
 
 
+def ide_import_root_from_workspace_path(path: Path) -> Path:
+    if path.parent.name == ".idea":
+        return path.parent.parent.resolve()
+    if path.parent.name == "workspace":
+        return path.parent.parent.resolve()
+    return path.parent.resolve()
+
+
 def iter_jetbrains_ide_dirs() -> Iterator[Path]:
     seen: set[Path] = set()
     system = platform.system()
@@ -1391,6 +1399,7 @@ def main() -> int:
     current_ide_cache: IdeCache | None = None
     current_ide_task_history_index: TaskHistoryIndex | None = None
     current_ide_repo_root: Path | None = None
+    current_ide_import_root: Path | None = None
     current_ide_jobs: list[ExportJob] = []
     current_ide_rename_ops: list[tuple[Path, Path, dict[str, str | None]]] = []
     current_ide_recovered = 0
@@ -1400,6 +1409,7 @@ def main() -> int:
 
     def flush_current_ide_state() -> None:
         nonlocal current_ide_name, current_ide_cache, current_ide_task_history_index, current_ide_repo_root
+        nonlocal current_ide_import_root
         nonlocal current_ide_jobs, current_ide_rename_ops
         nonlocal current_ide_recovered, current_ide_written
         nonlocal current_ide_recovered_by_model, current_ide_written_by_model
@@ -1445,6 +1455,7 @@ def main() -> int:
             current_ide_cache = None
         current_ide_task_history_index = None
         current_ide_repo_root = None
+        current_ide_import_root = None
         current_ide_jobs = []
         current_ide_rename_ops = []
 
@@ -1479,6 +1490,7 @@ def main() -> int:
                     cache_root_for_ide(args.output_dir, ide_name, flatten_ide_output),
                     use_disk_cache=not args.no_disk_cache,
                 )
+                current_ide_import_root = ide_import_root_from_workspace_path(input_path)
                 prime_model_uid_indexes(current_ide_cache, current_ide_cache.cache_root, verbose=verbose)
                 if current_ide_cache.dirty:
                     save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
@@ -1499,7 +1511,7 @@ def main() -> int:
                 current_ide_jobs = []
                 current_ide_rename_ops = []
                 if not args.quiet:
-                    print(f"Processing IDE: {ide_name}", flush=True)
+                    print(f"Processing IDE: {ide_name} [{current_ide_import_root}]", flush=True)
             verbose_print(verbose, 4, f"start extract_chat_sessions: {input_path}")
             sessions = extract_chat_sessions(input_path, verbose=verbose)
             verbose_print(verbose, 4, f"end extract_chat_sessions: {input_path} sessions={len(sessions)}")
