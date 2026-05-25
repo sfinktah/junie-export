@@ -841,12 +841,19 @@ def summarize_block(event: dict) -> str | None:
     if kind == "com.intellij.ml.llm.aui.events.api.ToolBlockUpdatedEvent":
         text = (event.get("text") or "").strip()
         details = (event.get("details") or "").strip()
-        parts = []
+        if not text and not details:
+            return None
+
+        lines = ["Tool:"]
         if text:
-            parts.append(text)
+            lines.append("```")
+            lines.extend(text.splitlines() or [""])
+            lines.append("```")
         if details:
-            parts.append(details)
-        return f"Tool: {' | '.join(parts)}" if parts else None
+            lines.append("```")
+            lines.extend(details.splitlines() or [""])
+            lines.append("```")
+        return "\n".join(lines)
 
     if kind == "com.intellij.ml.llm.aui.events.api.ViewFilesBlockUpdatedEvent":
         files = event.get("files") or []
