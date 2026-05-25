@@ -846,7 +846,7 @@ def summarize_block(event: dict) -> str | None:
 
         lines = ["Tool:"]
         if text:
-            lines.append("```")
+            lines.append("```shell")
             lines.extend(text.splitlines() or [""])
             lines.append("```")
         if details:
@@ -903,7 +903,7 @@ def render_terminal_block(command: str, status: str, details: str) -> str:
         heading = f"Terminal _({status.lower()})_"
 
     lines = [f"{heading}:"]
-    lines.append("```powershell")
+    lines.append("```shell")
     lines.extend(command.splitlines() or [""])
     lines.append("```")
     if details.strip():

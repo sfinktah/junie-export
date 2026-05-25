@@ -216,37 +216,37 @@ After writing each markdown file, the exporter also sets the file timestamp from
 
 Run from the repository root:
 
-```powershell
+```shell
 python .\aichat_export\extract_aichat.py
 ```
 
 To export a specific workspace file or directory:
 
-```powershell
+```shell
 python .\aichat_export\extract_aichat.py C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\workspace\2W9cqLpuxpUxyNVO6Pi0AKhtraW.xml
 ```
 
 To override the output directory:
 
-```powershell
+```shell
 python .\aichat_export\extract_aichat.py --output-dir C:\tmp\aichat_export
 ```
 
 To point at a different task-history root:
 
-```powershell
+```shell
 python .\aichat_export\extract_aichat.py --task-history-root C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\aia-task-history
 ```
 
 To preserve existing exports when the same session UID already exists:
 
-```powershell
+```shell
 python .\aichat_export\extract_aichat.py --ignore-existing
 ```
 
 To export one IDE from a WSL-mounted Windows JetBrains workspace path:
 
-```powershell
+```shell
 python extract_aichat.py --ignore-existing --output-dir ../markle/aichat-history/PhpStorm2026.1 /mnt/c/Users/sfinktah/AppData/Roaming/JetBrains/PhpStorm2026.1/workspace/*.xml
 ```
 
