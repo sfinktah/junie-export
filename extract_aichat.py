@@ -145,6 +145,7 @@ CHAT_SESSION_MARKER = '<component name="ChatSessionStateTemp">'
 SESSION_UID_PREFIX = "Session UID: `"
 IDE_CACHE_FILENAME = ".aichat_export_cache.json"
 IDE_CACHE_VERSION = 1
+FLAT_MODEL_OUTPUT_KEY = "__flat__"
 EVENT_PROMPT_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionUserPromptEvent"
 EVENT_MESSAGE_BLOCK_TYPE = "com.intellij.ml.llm.chat.shared.ChatSessionMessageBlockEvent"
 EVENTS_FILE_SUFFIX = ".events"
@@ -285,7 +286,9 @@ class IdeCache:
     prompt_to_events: dict[str, str]
     dirty: bool = False
 
-    def model_index(self, model_component: str) -> dict[str, str | None]:
+    def model_index(self, model_component: str, flat_model_output: bool = False) -> dict[str, str | None]:
+        if flat_model_output:
+            model_component = FLAT_MODEL_OUTPUT_KEY
         return self.model_output_uids.setdefault(model_component, {})
 
 
@@ -637,7 +640,7 @@ def save_ide_cache(cache: IdeCache, use_disk_cache: bool = True) -> None:
     cache.dirty = False
 
 
-def prime_model_uid_indexes(cache: IdeCache, cache_root: Path, verbose: bool = False) -> None:
+def prime_model_uid_indexes(cache: IdeCache, cache_root: Path, verbose: bool = False, flat_model_output: bool = False) -> None:
     updated = False
     verbose_print(verbose, 4, f"start scanning existing .md files: {cache_root}")
 
@@ -648,47 +651,88 @@ def prime_model_uid_indexes(cache: IdeCache, cache_root: Path, verbose: bool = F
                 cache.dirty = True
             return
 
-        for model_dir in sorted(path for path in cache_root.iterdir() if path.is_dir()):
-            model_component = model_dir.name
-            model_index = cache.model_output_uids.setdefault(model_component, {})
+        if flat_model_output:
+            flat_index = cache.model_output_uids.setdefault(FLAT_MODEL_OUTPUT_KEY, {})
+            if any(key != FLAT_MODEL_OUTPUT_KEY for key in cache.model_output_uids):
+                cache.model_output_uids = {FLAT_MODEL_OUTPUT_KEY: flat_index}
+                updated = True
+
             disk_names: set[str] = set()
             scanned = 0
             added = 0
             removed = 0
-            verbose_print(verbose, 4, f"start reading existing .md files: {model_dir}")
+            verbose_print(verbose, 4, f"start reading existing .md files: {cache_root}")
 
-            for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
+            for md_path in cache_root.glob(f"*{MARKDOWN_SUFFIX}"):
                 if not md_path.is_file():
                     continue
                 scanned += 1
                 disk_names.add(md_path.name)
-                if md_path.name in model_index:
+                if md_path.name in flat_index:
                     continue
                 uid = read_session_uid_from_markdown(md_path)
-                model_index[md_path.name] = uid
+                flat_index[md_path.name] = uid
                 added += 1
                 updated = True
 
-            missing_names = [name for name in model_index if name not in disk_names]
+            missing_names = [name for name in flat_index if name not in disk_names]
             if missing_names:
                 for name in missing_names:
-                    del model_index[name]
+                    del flat_index[name]
                 removed = len(missing_names)
                 updated = True
 
             verbose_print(
                 verbose,
                 4,
-                f"end reading existing .md files: {model_dir} scanned={scanned} added={added} removed={removed}",
+                f"end reading existing .md files: {cache_root} scanned={scanned} added={added} removed={removed}",
             )
-
-        for model_component in list(cache.model_output_uids):
-            model_dir = cache_root / model_component
-            if model_dir.is_dir():
-                continue
-            if cache.model_output_uids[model_component]:
-                cache.model_output_uids[model_component] = {}
+        else:
+            if FLAT_MODEL_OUTPUT_KEY in cache.model_output_uids:
+                del cache.model_output_uids[FLAT_MODEL_OUTPUT_KEY]
                 updated = True
+
+            for model_dir in sorted(path for path in cache_root.iterdir() if path.is_dir()):
+                model_component = model_dir.name
+                model_index = cache.model_output_uids.setdefault(model_component, {})
+                disk_names: set[str] = set()
+                scanned = 0
+                added = 0
+                removed = 0
+                verbose_print(verbose, 4, f"start reading existing .md files: {model_dir}")
+
+                for md_path in model_dir.glob(f"*{MARKDOWN_SUFFIX}"):
+                    if not md_path.is_file():
+                        continue
+                    scanned += 1
+                    disk_names.add(md_path.name)
+                    if md_path.name in model_index:
+                        continue
+                    uid = read_session_uid_from_markdown(md_path)
+                    model_index[md_path.name] = uid
+                    added += 1
+                    updated = True
+
+                missing_names = [name for name in model_index if name not in disk_names]
+                if missing_names:
+                    for name in missing_names:
+                        del model_index[name]
+                    removed = len(missing_names)
+                    updated = True
+
+                verbose_print(
+                    verbose,
+                    4,
+                    f"end reading existing .md files: {model_dir} scanned={scanned} added={added} removed={removed}",
+                )
+
+            for model_component in list(cache.model_output_uids):
+                model_dir = cache_root / model_component
+                if model_dir.is_dir():
+                    continue
+                if cache.model_output_uids[model_component]:
+                    cache.model_output_uids[model_component] = {}
+                    updated = True
 
         if updated:
             cache.dirty = True
@@ -1364,6 +1408,11 @@ def main() -> int:
         action="store_true",
         help="Write all exports directly under the output directory instead of creating separate directories per IDE.",
     )
+    parser.add_argument(
+        "--no-model-dirs",
+        action="store_true",
+        help="Write all exports directly under the current output scope instead of creating separate directories per chat model.",
+    )
     file_dates_group = parser.add_mutually_exclusive_group()
     file_dates_group.add_argument(
         "--file-dates",
@@ -1435,6 +1484,7 @@ def main() -> int:
     flatten_ide_output = should_flatten_output(args.paths)
     per_workspace_output = args.workspace_dirs
     no_ide_subdir = args.no_ide_dirs
+    no_model_dirs = args.no_model_dirs
     current_ide_name: str | None = None
     current_output_scope_key: Path | None = None
     current_ide_cache: IdeCache | None = None
@@ -1537,7 +1587,12 @@ def main() -> int:
                     output_scope_key,
                     use_disk_cache=not args.no_disk_cache,
                 )
-                prime_model_uid_indexes(current_ide_cache, current_ide_cache.cache_root, verbose=verbose)
+                prime_model_uid_indexes(
+                    current_ide_cache,
+                    current_ide_cache.cache_root,
+                    verbose=verbose,
+                    flat_model_output=no_model_dirs,
+                )
                 if current_ide_cache.dirty:
                     save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
                 debug_dir = current_ide_cache.cache_root / "debug-event-records" if debug else None
@@ -1565,12 +1620,14 @@ def main() -> int:
             verbose_print(verbose, 4, f"end extract_chat_sessions: {input_path} sessions={len(sessions)}")
             for session in sessions:
                 model_component = sanitize_path_component(session.model_id)
-                if flatten_ide_output:
+                if no_model_dirs:
+                    model_dir = current_ide_cache.cache_root
+                elif flatten_ide_output:
                     model_dir = args.output_dir / model_component
                 else:
                     model_dir = current_ide_cache.cache_root / model_component
 
-                existing_uids = current_ide_cache.model_index(model_component)
+                existing_uids = current_ide_cache.model_index(model_component, flat_model_output=no_model_dirs)
 
                 if args.ignore_existing and session.model_id.startswith("agent_"):
                     if has_existing_output_with_uid(existing_uids, session.uid):
