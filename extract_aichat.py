@@ -1359,6 +1359,11 @@ def main() -> int:
         action="store_true",
         help="Nest exports under a workspace directory named after each workspace XML file.",
     )
+    parser.add_argument(
+        "--no-ide-subdir",
+        action="store_true",
+        help="Write all exports directly under the output directory instead of creating a separate directory per IDE.",
+    )
     file_dates_group = parser.add_mutually_exclusive_group()
     file_dates_group.add_argument(
         "--file-dates",
@@ -1429,8 +1434,9 @@ def main() -> int:
     debug = args.debug
     flatten_ide_output = should_flatten_output(args.paths)
     per_workspace_output = args.workspace_dirs
+    no_ide_subdir = args.no_ide_subdir
     current_ide_name: str | None = None
-    current_output_scope_key: str | tuple[str, str] | None = None
+    current_output_scope_key: Path | None = None
     current_ide_cache: IdeCache | None = None
     current_ide_task_history_index: TaskHistoryIndex | None = None
     current_ide_jobs: list[ExportJob] = []
@@ -1514,25 +1520,21 @@ def main() -> int:
 
     try:
         for input_path, ide_name in input_items:
-            workspace_name = workspace_name_from_workspace_path(input_path)
-            output_scope_key: str | tuple[str, str]
-            if per_workspace_output:
-                output_scope_key = (ide_name, workspace_name)
-            else:
-                output_scope_key = ide_name
+            output_scope_key = cache_root_for_workspace(
+                args.output_dir,
+                ide_name,
+                input_path,
+                flatten_ide_output,
+                per_workspace_output,
+                no_ide_subdir,
+            )
 
             if output_scope_key != current_output_scope_key:
                 flush_current_ide_state()
                 current_ide_name = ide_name
                 current_output_scope_key = output_scope_key
                 current_ide_cache = load_ide_cache(
-                    cache_root_for_workspace(
-                        args.output_dir,
-                        ide_name,
-                        input_path,
-                        flatten_ide_output,
-                        per_workspace_output,
-                    ),
+                    output_scope_key,
                     use_disk_cache=not args.no_disk_cache,
                 )
                 prime_model_uid_indexes(current_ide_cache, current_ide_cache.cache_root, verbose=verbose)

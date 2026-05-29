@@ -19,7 +19,9 @@ If you enable `--workspace-dirs`, the exporter adds a workspace layer:
 <output-dir>\<IDEName>\<workspace>\<chatModelId>\<title>.md
 ```
 
-If you pass exactly one explicit IDE root or workspace file, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`. With `--workspace-dirs`, that flattened layout becomes `<output-dir>\<workspace>\<chatModelId>\`.
+If you enable `--no-ide-subdir`, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`. With `--workspace-dirs`, that becomes `<output-dir>\<workspace>\<chatModelId>\`.
+
+If you pass exactly one explicit IDE root or workspace file, the exporter also flattens the IDE layer. `--no-ide-subdir` gives you the same layout explicitly for project-local output paths.
 
 The default output directory is `C:\tmp\aichat\` on Windows and `/tmp/aichat` on Unix-like systems, but you can point it anywhere. If you want the exported AI history to live with the project, use a directory inside the repository. That makes later searching and diffing much easier.
 
@@ -174,6 +176,7 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Base directory for markdown exports.
   - By default the script creates `<output-dir>\<IDEName>\<chatModelId>\` underneath it.
   - If you pass exactly one explicit IDE root or workspace file, it writes directly to `<output-dir>\<chatModelId>\`.
+  - `--no-ide-subdir` also writes directly to `<output-dir>\<chatModelId>\`, which is useful for project-local destinations.
   - With `--workspace-dirs`, the layout becomes `<output-dir>\<IDEName>\<workspace>\<chatModelId>\`, or `<output-dir>\<workspace>\<chatModelId>\` when the layout is flattened.
   - This can be a project-local directory if you want the AI history stored alongside the code.
 - `--task-history-root`
@@ -183,6 +186,8 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Skip writing a file when an existing export already has the same session UID.
 - `--workspace-dirs`
   - Nest exports one level deeper under a directory named after each workspace XML file.
+- `--no-ide-subdir`
+  - Write all exports directly under the output directory instead of creating a separate directory per IDE.
 - `--file-dates`
   - Prefix output filenames with the local timestamp of each conversation.
 - `--no-file-dates`
@@ -212,7 +217,13 @@ With `--workspace-dirs`, that becomes:
 <output-dir>\<IDE>\<workspace>\.aichat_export_cache.json
 ```
 
-When you pass exactly one explicit IDE root or workspace file and the exporter flattens the output layout, the cache lives directly under the output directory instead:
+With `--no-ide-subdir`, the cache lives directly under the output directory:
+
+```text
+<output-dir>\.aichat_export_cache.json
+```
+
+When you pass exactly one explicit IDE root or workspace file and the exporter flattens the output layout, the cache also lives directly under the output directory:
 
 ```text
 <output-dir>\.aichat_export_cache.json
