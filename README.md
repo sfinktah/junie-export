@@ -13,7 +13,13 @@ The output is grouped by IDE name and `chatModelId`, so the final path shape is:
 <output-dir>\<IDEName>\<chatModelId>\<title>.md
 ```
 
-If you pass exactly one explicit IDE root or workspace file, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`.
+If you enable `--workspace-dirs`, the exporter adds a workspace layer:
+
+```text
+<output-dir>\<IDEName>\<workspace>\<chatModelId>\<title>.md
+```
+
+If you pass exactly one explicit IDE root or workspace file, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`. With `--workspace-dirs`, that flattened layout becomes `<output-dir>\<workspace>\<chatModelId>\`.
 
 The default output directory is `C:\tmp\aichat\` on Windows and `/tmp/aichat` on Unix-like systems, but you can point it anywhere. If you want the exported AI history to live with the project, use a directory inside the repository. That makes later searching and diffing much easier.
 
@@ -168,12 +174,15 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Base directory for markdown exports.
   - By default the script creates `<output-dir>\<IDEName>\<chatModelId>\` underneath it.
   - If you pass exactly one explicit IDE root or workspace file, it writes directly to `<output-dir>\<chatModelId>\`.
+  - With `--workspace-dirs`, the layout becomes `<output-dir>\<IDEName>\<workspace>\<chatModelId>\`, or `<output-dir>\<workspace>\<chatModelId>\` when the layout is flattened.
   - This can be a project-local directory if you want the AI history stored alongside the code.
 - `--task-history-root`
   - Optional root directory containing JetBrains `aia-task-history` files for recovery.
   - If omitted, the script auto-discovers `aia-task-history` directories under the relevant JetBrains roots for the current platform, including mounted Windows paths under WSL.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
+- `--workspace-dirs`
+  - Nest exports one level deeper under a directory named after each workspace XML file.
 - `--file-dates`
   - Prefix output filenames with the local timestamp of each conversation.
 - `--no-file-dates`
@@ -187,14 +196,20 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
 - `-v`, `--verbose`
   - Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.
 - `-d`, `--debug`
-  - Write decoded event record files to `debug-event-records` under each IDE output directory.
+  - Write decoded event record files to `debug-event-records` under each output scope directory.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 
-The exporter keeps a per-IDE cache at:
+The exporter keeps a cache under the current output scope:
 
 ```text
 <output-dir>\<IDE>\.aichat_export_cache.json
+```
+
+With `--workspace-dirs`, that becomes:
+
+```text
+<output-dir>\<IDE>\<workspace>\.aichat_export_cache.json
 ```
 
 When you pass exactly one explicit IDE root or workspace file and the exporter flattens the output layout, the cache lives directly under the output directory instead:
