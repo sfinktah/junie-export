@@ -1360,9 +1360,9 @@ def main() -> int:
         help="Nest exports under a workspace directory named after each workspace XML file.",
     )
     parser.add_argument(
-        "--no-ide-subdir",
+        "--no-ide-dirs",
         action="store_true",
-        help="Write all exports directly under the output directory instead of creating a separate directory per IDE.",
+        help="Write all exports directly under the output directory instead of creating separate directories per IDE.",
     )
     file_dates_group = parser.add_mutually_exclusive_group()
     file_dates_group.add_argument(
@@ -1434,7 +1434,7 @@ def main() -> int:
     debug = args.debug
     flatten_ide_output = should_flatten_output(args.paths)
     per_workspace_output = args.workspace_dirs
-    no_ide_subdir = args.no_ide_subdir
+    no_ide_subdir = args.no_ide_dirs
     current_ide_name: str | None = None
     current_output_scope_key: Path | None = None
     current_ide_cache: IdeCache | None = None
