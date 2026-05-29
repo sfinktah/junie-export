@@ -1518,7 +1518,10 @@ def main() -> int:
                 current_ide_jobs = []
                 current_ide_rename_ops = []
                 if not args.quiet:
-                    print(f"Processing IDE: {ide_name} [{current_ide_import_root}]", flush=True)
+                    print(
+                        f"Processing IDE: {ide_name} [workspace: {input_path.resolve()}]",
+                        flush=True,
+                    )
             verbose_print(verbose, 4, f"start extract_chat_sessions: {input_path}")
             sessions = extract_chat_sessions(input_path, verbose=verbose)
             verbose_print(verbose, 4, f"end extract_chat_sessions: {input_path} sessions={len(sessions)}")
