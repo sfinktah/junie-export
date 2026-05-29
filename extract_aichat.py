@@ -303,6 +303,7 @@ class ExportJob:
     input_path: Path
     session: ChatSession
     recovered_turns: list[RecoveredTurn]
+    debug_event_records_path: Path | None
     output_path: Path
     rename_source: Path | None
     existing_uids: dict[str, str | None]
@@ -1169,13 +1170,13 @@ def recover_junie_turns(
     cache: IdeCache,
     task_history_index: TaskHistoryIndex,
     verbose: bool = False,
-) -> list[RecoveredTurn]:
+) -> tuple[list[RecoveredTurn], Path | None]:
     if not session.model_id.startswith("agent_"):
-        return []
+        return [], None
 
     first_prompt = next((msg.display_content for msg in session.messages if msg.author != "Assistant" and msg.display_content.strip()), "")
     if not first_prompt:
-        return []
+        return [], None
 
     events_path = find_matching_task_history_file(
         cache,
@@ -1186,9 +1187,16 @@ def recover_junie_turns(
         verbose=verbose,
     )
     if not events_path:
-        return []
+        return [], None
 
-    return build_turn_summaries(events_path, verbose=verbose, debug_index=task_history_index)
+    debug_event_records_path = None
+    if task_history_index.debug_dir is not None:
+        debug_event_records_path = debug_event_records_output_path(task_history_index.debug_dir, events_path.resolve())
+
+    return (
+        build_turn_summaries(events_path, verbose=verbose, debug_index=task_history_index),
+        debug_event_records_path,
+    )
 
 
 def format_message(message: ChatMessage) -> str:
@@ -1212,9 +1220,16 @@ def format_message(message: ChatMessage) -> str:
     return "\n".join(parts)
 
 
-def render_session(session: ChatSession, source_name: str, recovered_turns: list[RecoveredTurn]) -> str:
+def render_session(
+    session: ChatSession,
+    source_name: str,
+    recovered_turns: list[RecoveredTurn],
+    debug_event_records_path: Path | None = None,
+) -> str:
     header_lines: list[str] = [f"# {session.title}", ""]
     info_lines = [f"Source: `{source_name}`"]
+    if debug_event_records_path is not None:
+        info_lines.append(f"Debug event records: `{debug_event_records_path}`")
     if session.uid:
         info_lines.append(f"Session UID: `{session.uid}`")
     info_lines.append(f"chatModelId: `{session.model_id}`")
@@ -1519,7 +1534,12 @@ def main() -> int:
         if current_ide_cache is not None and current_ide_jobs:
             for job in current_ide_jobs:
                 job.output_path.write_text(
-                    render_session(job.session, source_name=str(job.input_path), recovered_turns=job.recovered_turns),
+                    render_session(
+                        job.session,
+                        source_name=str(job.input_path),
+                        recovered_turns=job.recovered_turns,
+                        debug_event_records_path=job.debug_event_records_path,
+                    ),
                     encoding="utf-8",
                 )
                 if not job.output_path.exists():
@@ -1633,7 +1653,7 @@ def main() -> int:
                     if has_existing_output_with_uid(existing_uids, session.uid):
                         continue
 
-                recovered_turns = recover_junie_turns(
+                recovered_turns, debug_event_records_path = recover_junie_turns(
                     session,
                     args.task_history_root,
                     current_ide_cache,
@@ -1666,6 +1686,7 @@ def main() -> int:
                         input_path=input_path,
                         session=session,
                         recovered_turns=recovered_turns,
+                        debug_event_records_path=debug_event_records_path,
                         output_path=plan.output_path,
                         rename_source=plan.rename_source,
                         existing_uids=existing_uids,

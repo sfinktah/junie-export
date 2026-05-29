@@ -209,6 +209,7 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - Emit tracing for workspace scanning, XML parsing, cache indexing, and task-history recovery.
 - `-d`, `--debug`
   - Write decoded event record files to `debug-event-records` under each output scope directory.
+  - For recovered `agent_*` chats, also include the decoded debug file path in the exported markdown header as `Debug event records: ...`.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 
