@@ -196,6 +196,8 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
 - `--task-history-root`
   - Optional root directory containing JetBrains `aia-task-history` files for recovery.
   - If omitted, the script auto-discovers `aia-task-history` directories under the relevant JetBrains roots for the current platform, including mounted Windows paths under WSL.
+- `--find`
+  - Only process chats whose prompts match the supplied regular expression.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
 - `--file-dates`
@@ -213,6 +215,9 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
 - `-d`, `--debug`
   - Write decoded event record files to `debug-event-records` under each output scope directory.
   - For recovered `agent_*` chats, also include the decoded debug file path in the exported markdown header as `Debug event records: ...`.
+  - When used together with `--find`, also inject matching excerpts from the relevant `idea*.log` files and `acp.log` into a `### Debug` section in the output.
+- `--stdout`
+  - Write rendered chats to stdout instead of markdown files.
 - `-q`, `--quiet`
   - Suppress progress and summary output.
 

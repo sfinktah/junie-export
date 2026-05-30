@@ -6,6 +6,7 @@ import hashlib
 import os
 import platform
 import subprocess
+import sys
 from datetime import datetime, timezone
 import html
 import json
@@ -24,6 +25,15 @@ def windows_roaming_appdata() -> Path:
         if appdata:
             return Path(appdata)
         return Path.home() / "AppData" / "Roaming"
+    return Path.home()
+
+
+def windows_local_appdata() -> Path:
+    if platform.system() == "Windows":
+        appdata = os.environ.get("LOCALAPPDATA")
+        if appdata:
+            return Path(appdata)
+        return Path.home() / "AppData" / "Local"
     return Path.home()
 
 
@@ -102,6 +112,39 @@ def get_windows_appdata_from_wsl() -> Path | None:
     return appdata if appdata.exists() else None
 
 
+def get_windows_local_appdata_from_wsl() -> Path | None:
+    if not is_wsl():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["cmd.exe", "/c", "echo", "%LOCALAPPDATA%"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        result = None
+
+    if result is not None:
+        local_appdata = result.stdout.strip()
+        if local_appdata and "%" not in local_appdata:
+            match = re.match(r"^([A-Za-z]):[\\/](.*)$", local_appdata)
+            if match:
+                drive = match.group(1).lower()
+                rest = match.group(2).replace("\\", "/")
+                candidate = Path(f"/mnt/{drive}/{rest}")
+                if candidate.exists():
+                    return candidate
+
+    win_home = get_windows_home_from_wsl()
+    if not win_home:
+        return None
+
+    local_appdata = win_home / "AppData" / "Local"
+    return local_appdata if local_appdata.exists() else None
+
+
 def jetbrains_workspace_globs() -> list[Path]:
     home = Path.home()
     system = platform.system()
@@ -132,6 +175,38 @@ def jetbrains_workspace_globs() -> list[Path]:
     return []
 
 
+def jetbrains_log_dir(ide_name: str) -> Path | None:
+    home = Path.home()
+    system = platform.system()
+
+    if system == "Windows":
+        return windows_local_appdata() / "JetBrains" / ide_name / "log"
+
+    if system == "Linux":
+        if is_wsl():
+            win_local_appdata = get_windows_local_appdata_from_wsl()
+            if win_local_appdata is not None:
+                return win_local_appdata / "JetBrains" / ide_name / "log"
+        return home / ".cache" / "JetBrains" / ide_name / "log"
+
+    if system == "Darwin":
+        return home / "Library" / "Logs" / "JetBrains" / ide_name
+
+    return None
+
+
+def jetbrains_ide_log_files(ide_name: str) -> list[Path]:
+    log_dir = jetbrains_log_dir(ide_name)
+    if log_dir is None or not log_dir.is_dir():
+        return []
+
+    files = [path for path in sorted(log_dir.glob("idea*.log")) if path.is_file()]
+    acp_log = log_dir / "acp" / "acp.log"
+    if acp_log.is_file():
+        files.append(acp_log)
+    return files
+
+
 def default_workspace_input() -> Path:
     globs = jetbrains_workspace_globs()
     if globs:
@@ -142,7 +217,7 @@ def default_workspace_input() -> Path:
 DEFAULT_INPUT = default_workspace_input()
 DEFAULT_OUTPUT_DIR = Path(r"C:\tmp\aichat") if platform.system() == "Windows" else Path("/tmp/aichat")
 CHAT_SESSION_MARKER = '<component name="ChatSessionStateTemp">'
-SESSION_UID_PREFIX = "Session UID: `"
+SESSION_UID_PREFIX = "Chat UID: `"
 IDE_CACHE_FILENAME = ".aichat_export_cache.json"
 IDE_CACHE_VERSION = 1
 FLAT_MODEL_OUTPUT_KEY = "__flat__"
@@ -154,13 +229,16 @@ DEFAULT_FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S - "
 WORKSPACE_SCAN_CHUNK_SIZE = 1024 * 1024
 MARKDOWN_UID_SCAN_SIZE = 1024
 SESSION_UID_RE = re.compile(
-    r"Session UID:\s*`?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`?",
+    r"(?:Session|Chat) UID:\s*`?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`?",
     re.IGNORECASE,
 )
 EVENT_FILENAME_UID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
     re.IGNORECASE,
 )
+LOG_ENTRY_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[\d+\]\s+")
+MATTERHORN_LOG_RE = re.compile(r"(?:\bc\.i\.m\.l\.|\bcom\.intellij\.ml\.llm\.matterhorn\b)", re.IGNORECASE)
+LOG_ENTRY_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[\d+\]\s+")
 FILENAME_SAFE_RE = re.compile(r"[^\w .()-]+", re.UNICODE)
 IDE_VERSION_SUFFIX_RE = re.compile(r"[0-9.]+$")
 WINDOWS_RESERVED_BASENAMES = {
@@ -253,6 +331,7 @@ def iter_workspace_files_from_ide_dir(ide_dir: Path) -> Iterator[Path]:
 
 @dataclass(frozen=True)
 class ChatMessage:
+    uid: str | None
     author: str
     display_content: str
     internal_content: str | None
@@ -306,11 +385,64 @@ class OutputPlan:
 
 
 @dataclass(frozen=True)
+class DebugLogSection:
+    filename: str
+    lines: list[str]
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    start_line: int
+    timestamp: datetime | None
+    lines: list[str]
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def parse_log_entry_timestamp(line: str) -> datetime | None:
+    if len(line) < 23:
+        return None
+    stamp = line[:23]
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S,%f")
+    except ValueError:
+        return None
+
+
+def log_entry_body(line: str) -> str:
+    return LOG_ENTRY_PREFIX_RE.sub("", line, count=1).strip()
+
+
+def log_entry_mentions_matterhorn(entry: LogEntry) -> bool:
+    return any(MATTERHORN_LOG_RE.search(line) is not None for line in entry.lines)
+
+
+def summarize_log_entry(entry: LogEntry) -> str:
+    parts: list[str] = []
+    for index, line in enumerate(entry.lines):
+        body = line.strip()
+        if not body:
+            continue
+        parts.append(body)
+    return " | ".join(parts)
+
+
+def log_entry_signature(entry: LogEntry) -> tuple[str, tuple[str, ...]]:
+    first_line = log_entry_body(entry.lines[0]) if entry.lines else ""
+    continuation_lines = tuple(line.strip() for line in entry.lines[1:] if line.strip())
+    return first_line, continuation_lines
+
+
+@dataclass(frozen=True)
 class ExportJob:
     input_path: Path
+    ide_name: str
     session: ChatSession
     recovered_turns: list[RecoveredTurn]
     debug_event_records_path: Path | None
+    debug_log_sections: list[DebugLogSection]
+    prompt_uid: str | None
     output_path: Path
     rename_source: Path | None
     existing_uids: dict[str, str | None]
@@ -529,11 +661,13 @@ def extract_chat_sessions(xml_path: Path, verbose: bool = False) -> list[ChatSes
         messages_parent = chat_node.find("./option[@name='messages']/list")
         if messages_parent is not None:
             for msg_node in messages_parent.findall("./SerializedChatMessage"):
+                message_uid = normalize_uuid_value(get_option_value(msg_node, "uid"))
                 author = get_option_value(msg_node, "author") or "User"
                 display_content = get_option_value(msg_node, "displayContent") or ""
                 internal_content = get_option_value(msg_node, "internalContent")
                 messages.append(
                     ChatMessage(
+                        uid=message_uid,
                         author=author,
                         display_content=display_content,
                         internal_content=internal_content,
@@ -1095,6 +1229,15 @@ def preprocess_output_title(title: str) -> str:
     return cleaned
 
 
+def normalize_uuid_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = EVENT_FILENAME_UID_RE.search(value)
+    if match:
+        return match.group(1).lower()
+    return value.strip() or None
+
+
 def extract_session_uid(text: str) -> str | None:
     match = SESSION_UID_RE.search(text)
     if match:
@@ -1188,6 +1331,37 @@ def maybe_quote(author: str, text: str) -> str:
     return quote_block(text)
 
 
+def first_user_prompt(session: ChatSession) -> ChatMessage | None:
+    for message in session.messages:
+        if message.author != "Assistant":
+            return message
+    return None
+
+
+def user_prompts(session: ChatSession) -> list[ChatMessage]:
+    return [message for message in session.messages if message.author != "Assistant"]
+
+
+def prompt_text_for_matching(message: ChatMessage | None) -> str:
+    if message is None:
+        return ""
+    if message.display_content.strip():
+        return message.display_content
+    if message.internal_content:
+        return message.internal_content
+    return ""
+
+
+def session_matches_find(session: ChatSession, find_pattern: re.Pattern[str] | None) -> bool:
+    if find_pattern is None:
+        return True
+    for message in user_prompts(session):
+        prompt = prompt_text_for_matching(message)
+        if prompt and find_pattern.search(prompt) is not None:
+            return True
+    return False
+
+
 def has_assistant_content(session: ChatSession) -> bool:
     for message in session.messages:
         if message.author != "Assistant":
@@ -1197,6 +1371,127 @@ def has_assistant_content(session: ChatSession) -> bool:
         ):
             return True
     return False
+
+
+def matching_log_terms(session: ChatSession) -> list[str]:
+    terms: list[str] = []
+    prompt_message = first_user_prompt(session)
+    for message in user_prompts(session):
+        prompt = prompt_text_for_matching(message)
+        if prompt:
+            terms.append(prompt)
+    if session.uid:
+        terms.append(session.uid)
+    prompt_uid = prompt_message.uid if prompt_message is not None else None
+    if prompt_uid:
+        terms.append(prompt_uid)
+    return list(dict.fromkeys(terms))
+
+
+def collect_log_sections(
+    ide_name: str,
+    session: ChatSession,
+    context_entries: int = 2,
+    max_gap_seconds: int = 180,
+    max_matterhorn_gap_seconds: int = 60,
+) -> list[DebugLogSection]:
+    log_files = jetbrains_ide_log_files(ide_name)
+    if not log_files:
+        return []
+
+    terms = [term for term in matching_log_terms(session) if term]
+    if not terms:
+        return []
+
+    sections: list[DebugLogSection] = []
+    for log_file in log_files:
+        try:
+            lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+
+        entries: list[LogEntry] = []
+        current_entry_start = 0
+        current_entry_timestamp: datetime | None = None
+        current_entry_lines: list[str] = []
+        for line_number, line in enumerate(lines):
+            if LOG_ENTRY_START_RE.match(line) and current_entry_lines:
+                entries.append(LogEntry(start_line=current_entry_start, timestamp=current_entry_timestamp, lines=current_entry_lines))
+                current_entry_start = line_number
+                current_entry_timestamp = parse_log_entry_timestamp(line)
+                current_entry_lines = [line]
+            else:
+                if not current_entry_lines:
+                    current_entry_start = line_number
+                    current_entry_timestamp = parse_log_entry_timestamp(line)
+                current_entry_lines.append(line)
+        if current_entry_lines:
+            entries.append(LogEntry(start_line=current_entry_start, timestamp=current_entry_timestamp, lines=current_entry_lines))
+
+        matching_indices = [
+            index
+            for index, entry in enumerate(entries)
+            if any(term.lower() in entry.text().lower() for term in terms)
+        ]
+        if not matching_indices:
+            continue
+
+        start_index = max(0, matching_indices[0] - context_entries)
+        stop_index = len(entries)
+        previous_timestamp = entries[start_index].timestamp
+        last_matterhorn_timestamp = entries[start_index].timestamp if log_entry_mentions_matterhorn(entries[start_index]) else None
+
+        for entry_index in range(start_index, len(entries)):
+            entry = entries[entry_index]
+            if entry_index > start_index and previous_timestamp is not None and entry.timestamp is not None:
+                gap_seconds = (entry.timestamp - previous_timestamp).total_seconds()
+                if gap_seconds > max_gap_seconds:
+                    stop_index = entry_index
+                    break
+            if last_matterhorn_timestamp is not None and entry.timestamp is not None:
+                matterhorn_gap_seconds = (entry.timestamp - last_matterhorn_timestamp).total_seconds()
+                if matterhorn_gap_seconds > max_matterhorn_gap_seconds:
+                    stop_index = entry_index
+                    break
+            previous_timestamp = entry.timestamp or previous_timestamp
+            if log_entry_mentions_matterhorn(entry) and entry.timestamp is not None:
+                last_matterhorn_timestamp = entry.timestamp
+
+        rendered: list[str] = []
+        previous_signature: tuple[str, tuple[str, ...]] | None = None
+        previous_rendered_index: int | None = None
+        previous_count = 0
+
+        def flush_previous() -> None:
+            nonlocal previous_signature, previous_rendered_index, previous_count
+            if previous_signature is None or previous_rendered_index is None:
+                return
+            if previous_count > 1:
+                rendered[previous_rendered_index] = f"{rendered[previous_rendered_index]} [x{previous_count}]"
+            previous_signature = None
+            previous_rendered_index = None
+            previous_count = 0
+
+        for entry in entries[start_index:stop_index]:
+            signature = log_entry_signature(entry)
+            summary = summarize_log_entry(entry)
+            if not summary:
+                continue
+            if previous_signature == signature and previous_rendered_index is not None:
+                previous_count += 1
+                continue
+
+            flush_previous()
+            rendered.append(f"    {entry.start_line + 1}: {summary}")
+            previous_signature = signature
+            previous_rendered_index = len(rendered) - 1
+            previous_count = 1
+
+        flush_previous()
+
+        sections.append(DebugLogSection(filename=log_file.name, lines=rendered))
+
+    return sections
 
 
 def recover_junie_turns(
@@ -1209,7 +1504,7 @@ def recover_junie_turns(
     if not session.model_id.startswith("agent_"):
         return [], None
 
-    first_prompt = next((msg.display_content for msg in session.messages if msg.author != "Assistant" and msg.display_content.strip()), "")
+    first_prompt = prompt_text_for_matching(first_user_prompt(session))
     if not first_prompt:
         return [], None
 
@@ -1234,11 +1529,14 @@ def recover_junie_turns(
     )
 
 
-def format_message(message: ChatMessage) -> str:
+def format_message(message: ChatMessage, debug_uid: str | None = None) -> str:
     body = message.display_content
     if message.author == "Assistant" and not body.strip() and not (message.internal_content and message.internal_content.strip()):
         return ""
-    parts: list[str] = [f"{message.author} said:"]
+    heading = "Assistant did" if message.author == "Assistant" and body.startswith("- ") else f"{message.author} said"
+    if debug_uid:
+        heading = f"{heading} [*{debug_uid}*]"
+    parts: list[str] = [f"{heading}:"]
 
     if message.internal_content is not None and message.internal_content != message.display_content:
         parts.append("")
@@ -1255,28 +1553,51 @@ def format_message(message: ChatMessage) -> str:
     return "\n".join(parts)
 
 
+def format_debug_sections(sections: list[DebugLogSection]) -> str:
+    if not sections:
+        return ""
+
+    lines: list[str] = ["### Debug"]
+    for section in sections:
+        lines.append(f"#### {section.filename}")
+        if section.lines:
+            lines.extend(section.lines)
+        else:
+            lines.append("    <no matching lines>")
+        lines.append("")
+
+    if lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
 def render_session(
     session: ChatSession,
     source_name: str,
+    prompt_uid: str | None,
     recovered_turns: list[RecoveredTurn],
     debug_event_records_path: Path | None = None,
+    debug_log_sections: list[DebugLogSection] | None = None,
+    debug_mode: bool = False,
 ) -> str:
     header_lines: list[str] = [f"# {session.title}", ""]
-    info_lines = [f"Source: `{source_name}`"]
+    info_lines = [f"Source: {source_name}"]
     if debug_event_records_path is not None:
-        info_lines.append(f"Debug event records: `{debug_event_records_path}`")
+        info_lines.append(f"Debug event records: {debug_event_records_path}")
     if session.uid:
-        info_lines.append(f"Session UID: `{session.uid}`")
-    info_lines.append(f"chatModelId: `{session.model_id}`")
+        info_lines.append(f"Chat UID: {session.uid}")
+    if prompt_uid:
+        info_lines.append(f"Prompt UID: {prompt_uid}")
+    info_lines.append(f"chatModelId: {session.model_id}")
     if session.source_action_type:
-        info_lines.append(f"sourceActionType: `{session.source_action_type}`")
+        info_lines.append(f"sourceActionType: {session.source_action_type}")
     if session.timestamp_ms is not None:
-        info_lines.append(f"Date: `{format_local_timestamp(session.timestamp_ms)}`")
+        info_lines.append(f"Date: {format_local_timestamp(session.timestamp_ms)}")
         if session.modified_at_ms is not None and session.modified_at_ms != session.timestamp_ms:
-            info_lines.append(f"Modified at: `{format_local_timestamp(session.modified_at_ms)}`")
+            info_lines.append(f"Modified at: {format_local_timestamp(session.modified_at_ms)}")
 
     for index, info_line in enumerate(info_lines):
-        header_lines.append(info_line)
+        header_lines.append(f"    {info_line}")
         # These blank lines turn out to be very unattractive.  Unfortunately the JetBrains markdown viewer doesn't
         # understand line breaks correctly.
         # if index != len(info_lines) - 1:
@@ -1285,17 +1606,24 @@ def render_session(
 
     assistant_turn_index = 0
     emitted_message = False
+    current_prompt_uid = None
     for message in session.messages:
         body = message.display_content
+        if message.author != "Assistant":
+            current_prompt_uid = message.uid
+        message_debug_uid = current_prompt_uid if debug_mode else None
         if message.author == "Assistant" and not body.strip() and assistant_turn_index < len(recovered_turns):
             recovered = recovered_turns[assistant_turn_index].to_markdown()
             if recovered.strip():
                 body = recovered
         formatted = ""
         if message.author == "Assistant" and body.startswith("- "):
-            formatted = "\n".join(["Assistant did:", "", body])
+            assistant_heading = "Assistant did"
+            if message_debug_uid:
+                assistant_heading = f"{assistant_heading} [*{message_debug_uid}*]"
+            formatted = "\n".join([f"{assistant_heading}:", "", body])
         else:
-            formatted = format_message(ChatMessage(message.author, body, message.internal_content))
+            formatted = format_message(ChatMessage(message.uid, message.author, body, message.internal_content), debug_uid=message_debug_uid)
         if not formatted:
             if message.author == "Assistant":
                 assistant_turn_index += 1
@@ -1306,6 +1634,11 @@ def render_session(
         emitted_message = True
         if message.author == "Assistant":
             assistant_turn_index += 1
+
+    debug_section = format_debug_sections(debug_log_sections or [])
+    if debug_section:
+        header_lines.append("")
+        header_lines.append(debug_section)
 
     header_lines.append("")
     return "\n".join(header_lines)
@@ -1444,6 +1777,12 @@ def main() -> int:
         help="Optional root directory containing aia-task-history files. If omitted, scans JetBrains IDE directories for aia-task-history automatically.",
     )
     parser.add_argument(
+        "--find",
+        type=str,
+        default=None,
+        help="Only process chats whose prompts match this regular expression.",
+    )
+    parser.add_argument(
         "--ignore-existing",
         action="store_true",
         help="Skip writing a file when an existing export has the same session UID.",
@@ -1547,12 +1886,31 @@ def main() -> int:
         action="store_true",
         help="Write decoded event record files to debug-event-records under each output scope directory.",
     )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Write rendered chats to stdout instead of markdown files.",
+    )
     args = parser.parse_args()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    find_pattern: re.Pattern[str] | None = None
+    if args.find is not None:
+        try:
+            find_pattern = re.compile(args.find)
+        except re.error as exc:
+            raise SystemExit(f"invalid --find regular expression: {exc}") from exc
+
+    if args.stdout:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    if not args.stdout:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
     git_executable = resolve_git_executable(args.git_bin, Path.cwd())
-    if args.git:
+    if args.git and not args.stdout:
         try:
             git_version = run_git(["--version"], Path.cwd(), git_executable)
         except FileNotFoundError as exc:
@@ -1567,6 +1925,7 @@ def main() -> int:
     written_by_model: Counter[str] = Counter()
     verbose = args.verbose
     debug = args.debug
+    stdout_mode = args.stdout
     flatten_ide_output = should_flatten_output(args.paths, args.ide_dirs)
     per_workspace_output = args.workspace_dirs
     no_ide_subdir = args.no_ide_dirs
@@ -1582,6 +1941,7 @@ def main() -> int:
     current_ide_written = 0
     current_ide_recovered_by_model: Counter[str] = Counter()
     current_ide_written_by_model: Counter[str] = Counter()
+    status_stream = sys.stderr if stdout_mode else sys.stdout
 
     def flush_current_ide_state() -> None:
         nonlocal current_ide_name, current_output_scope_key, current_ide_cache, current_ide_task_history_index
@@ -1589,7 +1949,7 @@ def main() -> int:
         nonlocal current_ide_recovered, current_ide_written
         nonlocal current_ide_recovered_by_model, current_ide_written_by_model
         nonlocal sessions_written
-        if current_ide_cache is not None and current_ide_rename_ops:
+        if not stdout_mode and current_ide_cache is not None and current_ide_rename_ops:
             for src, dst, existing_uids in current_ide_rename_ops:
                 rename_many(
                     [(src, dst)],
@@ -1605,31 +1965,41 @@ def main() -> int:
 
         if current_ide_cache is not None and current_ide_jobs:
             for job in current_ide_jobs:
-                job.output_path.write_text(
-                    render_session(
-                        job.session,
-                        source_name=str(job.input_path),
-                        recovered_turns=job.recovered_turns,
-                        debug_event_records_path=job.debug_event_records_path,
-                    ),
-                    encoding="utf-8",
+                rendered = render_session(
+                    job.session,
+                    source_name=str(job.input_path),
+                    prompt_uid=job.prompt_uid,
+                    recovered_turns=job.recovered_turns,
+                    debug_event_records_path=job.debug_event_records_path,
+                    debug_log_sections=job.debug_log_sections,
+                    debug_mode=debug,
                 )
-                if not job.output_path.exists():
-                    raise RuntimeError(f"write completed but destination is missing: {job.output_path}")
-                if job.session.timestamp_ms is not None:
-                    try:
-                        set_file_timestamp(str(job.output_path), job.session.timestamp_ms)
-                    except OSError:
-                        pass
-                job.existing_uids[job.output_path.name] = job.session.uid
-                current_ide_cache.dirty = True
+                if stdout_mode:
+                    if sessions_written:
+                        print("", flush=True)
+                    print(rendered, end="", flush=True)
+                else:
+                    job.output_path.write_text(
+                        rendered,
+                        encoding="utf-8",
+                    )
+                    if not job.output_path.exists():
+                        raise RuntimeError(f"write completed but destination is missing: {job.output_path}")
+                    if job.session.timestamp_ms is not None:
+                        try:
+                            set_file_timestamp(str(job.output_path), job.session.timestamp_ms)
+                        except OSError:
+                            pass
+                    job.existing_uids[job.output_path.name] = job.session.uid
+                    current_ide_cache.dirty = True
                 written_by_model[job.session.model_id] += 1
                 current_ide_written_by_model[job.session.model_id] += 1
                 current_ide_written += 1
                 sessions_written += 1
 
         if current_ide_cache is not None:
-            save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
+            if not stdout_mode:
+                save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
 
         if current_ide_cache is not None:
             current_ide_cache = None
@@ -1641,18 +2011,18 @@ def main() -> int:
         if current_ide_name is None or args.quiet:
             return
         if current_ide_recovered == 0:
-            print("  No conversations were found.", flush=True)
+            print("  No conversations were found.", file=status_stream, flush=True)
         elif args.ignore_existing:
-            print("  Recovered conversations by model:", flush=True)
+            print("  Recovered conversations by model:", file=status_stream, flush=True)
             for model_id in sorted(current_ide_recovered_by_model):
                 recovered = current_ide_recovered_by_model[model_id]
                 written = current_ide_written_by_model.get(model_id, 0)
-                print(f"    {model_id}: recovered={recovered}, written={written}", flush=True)
+                print(f"    {model_id}: recovered={recovered}, written={written}", file=status_stream, flush=True)
         else:
-            print("  Recovered conversations by model:", flush=True)
+            print("  Recovered conversations by model:", file=status_stream, flush=True)
             for model_id in sorted(current_ide_recovered_by_model):
                 recovered = current_ide_recovered_by_model[model_id]
-                print(f"    {model_id}: recovered={recovered}", flush=True)
+                print(f"    {model_id}: recovered={recovered}", file=status_stream, flush=True)
 
     input_items: Iterator[tuple[Path, str]]
     if args.paths:
@@ -1686,15 +2056,15 @@ def main() -> int:
                     verbose=verbose,
                     flat_model_output=no_model_dirs,
                 )
-                if current_ide_cache.dirty:
+                if current_ide_cache.dirty and not stdout_mode:
                     save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
-                debug_dir = current_ide_cache.cache_root / "debug-event-records" if debug else None
+                debug_dir = None if stdout_mode else (current_ide_cache.cache_root / "debug-event-records" if debug else None)
                 current_ide_task_history_index = build_task_history_index(
                     args.task_history_root,
                     verbose=verbose,
                     debug_dir=debug_dir,
                 )
-                if args.git:
+                if args.git and not stdout_mode:
                     if git_root(current_ide_cache.cache_root, git_executable) is None:
                         raise SystemExit(f"{current_ide_cache.cache_root} is not inside a git repository")
                 current_ide_recovered = 0
@@ -1706,12 +2076,16 @@ def main() -> int:
             if not args.quiet:
                 print(
                     f"Processing workspace: {input_path.resolve()} [IDE: {ide_name}]",
+                    file=status_stream,
                     flush=True,
                 )
             verbose_print(verbose, 4, f"start extract_chat_sessions: {input_path}")
             sessions = extract_chat_sessions(input_path, verbose=verbose)
             verbose_print(verbose, 4, f"end extract_chat_sessions: {input_path} sessions={len(sessions)}")
             for session in sessions:
+                if not session_matches_find(session, find_pattern):
+                    continue
+
                 model_component = sanitize_path_component(session.model_id)
                 if no_model_dirs:
                     model_dir = current_ide_cache.cache_root
@@ -1736,6 +2110,10 @@ def main() -> int:
                 if not has_assistant_content(session) and not recovered_turns:
                     continue
 
+                prompt = first_user_prompt(session)
+                prompt_uid = prompt.uid if prompt is not None else None
+                debug_log_sections = collect_log_sections(ide_name, session) if debug and find_pattern is not None else []
+
                 plan = plan_output_path(
                     model_dir,
                     session.title,
@@ -1751,15 +2129,19 @@ def main() -> int:
                 recovered_by_model[session.model_id] += 1
                 current_ide_recovered += 1
                 current_ide_recovered_by_model[session.model_id] += 1
-                model_dir.mkdir(parents=True, exist_ok=True)
-                if plan.rename_source is not None and plan.rename_source != plan.output_path:
+                if not stdout_mode:
+                    model_dir.mkdir(parents=True, exist_ok=True)
+                if not stdout_mode and plan.rename_source is not None and plan.rename_source != plan.output_path:
                     current_ide_rename_ops.append((plan.rename_source, plan.output_path, existing_uids))
                 current_ide_jobs.append(
                     ExportJob(
                         input_path=input_path,
+                        ide_name=ide_name,
                         session=session,
                         recovered_turns=recovered_turns,
                         debug_event_records_path=debug_event_records_path,
+                        debug_log_sections=debug_log_sections,
+                        prompt_uid=prompt_uid,
                         output_path=plan.output_path,
                         rename_source=plan.rename_source,
                         existing_uids=existing_uids,
@@ -1768,7 +2150,7 @@ def main() -> int:
 
         flush_current_ide_state()
     except Exception:
-        if current_ide_cache is not None and current_ide_cache.dirty:
+        if current_ide_cache is not None and current_ide_cache.dirty and not stdout_mode:
             try:
                 save_ide_cache(current_ide_cache, use_disk_cache=not args.no_disk_cache)
             except Exception:
@@ -1776,18 +2158,21 @@ def main() -> int:
         raise
 
     if not args.quiet:
-        print(f"Grand total: Wrote {sessions_written} chat markdown file(s) to {args.output_dir}", flush=True)
+        if stdout_mode:
+            print(f"Grand total: Wrote {sessions_written} chat markdown session(s) to stdout", file=status_stream, flush=True)
+        else:
+            print(f"Grand total: Wrote {sessions_written} chat markdown file(s) to {args.output_dir}", flush=True)
         if recovered_by_model:
-            print("Recovered conversations by model:", flush=True)
+            print("Recovered conversations by model:", file=status_stream, flush=True)
             for model_id in sorted(recovered_by_model):
                 recovered = recovered_by_model[model_id]
                 if args.ignore_existing:
                     written = written_by_model.get(model_id, 0)
-                    print(f"  {model_id}: recovered={recovered}, written={written}", flush=True)
+                    print(f"  {model_id}: recovered={recovered}, written={written}", file=status_stream, flush=True)
                 else:
-                    print(f"  {model_id}: recovered={recovered}", flush=True)
+                    print(f"  {model_id}: recovered={recovered}", file=status_stream, flush=True)
         else:
-            print("Recovered conversations by model: none", flush=True)
+            print("Recovered conversations by model: none", file=status_stream, flush=True)
     return 0
 
 
