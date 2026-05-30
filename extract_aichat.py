@@ -1373,13 +1373,14 @@ def has_assistant_content(session: ChatSession) -> bool:
     return False
 
 
-def matching_log_terms(session: ChatSession) -> list[str]:
+def matching_log_terms(session: ChatSession, include_prompt_text: bool = True) -> list[str]:
     terms: list[str] = []
     prompt_message = first_user_prompt(session)
-    for message in user_prompts(session):
-        prompt = prompt_text_for_matching(message)
-        if prompt:
-            terms.append(prompt)
+    if include_prompt_text:
+        for message in user_prompts(session):
+            prompt = prompt_text_for_matching(message)
+            if prompt:
+                terms.append(prompt)
     if session.uid:
         terms.append(session.uid)
     prompt_uid = prompt_message.uid if prompt_message is not None else None
@@ -1399,12 +1400,10 @@ def collect_log_sections(
     if not log_files:
         return []
 
-    terms = [term for term in matching_log_terms(session) if term]
-    if not terms:
-        return []
-
     sections: list[DebugLogSection] = []
     for log_file in log_files:
+        include_prompt_text = log_file.name != "acp.log"
+        file_context_entries = 0 if log_file.name == "acp.log" else context_entries
         try:
             lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
@@ -1428,15 +1427,19 @@ def collect_log_sections(
         if current_entry_lines:
             entries.append(LogEntry(start_line=current_entry_start, timestamp=current_entry_timestamp, lines=current_entry_lines))
 
+        file_terms = [term for term in matching_log_terms(session, include_prompt_text=include_prompt_text) if term]
+        if not file_terms:
+            continue
+
         matching_indices = [
             index
             for index, entry in enumerate(entries)
-            if any(term.lower() in entry.text().lower() for term in terms)
+            if any(term.lower() in entry.text().lower() for term in file_terms)
         ]
         if not matching_indices:
             continue
 
-        start_index = max(0, matching_indices[0] - context_entries)
+        start_index = max(0, matching_indices[0] - file_context_entries)
         stop_index = len(entries)
         previous_timestamp = entries[start_index].timestamp
         last_matterhorn_timestamp = entries[start_index].timestamp if log_entry_mentions_matterhorn(entries[start_index]) else None
