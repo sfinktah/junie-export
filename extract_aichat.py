@@ -162,6 +162,7 @@ EVENT_FILENAME_UID_RE = re.compile(
     re.IGNORECASE,
 )
 FILENAME_SAFE_RE = re.compile(r"[^\w .()-]+", re.UNICODE)
+IDE_VERSION_SUFFIX_RE = re.compile(r"[0-9.]+$")
 WINDOWS_RESERVED_BASENAMES = {
     "CON",
     "PRN",
@@ -180,6 +181,12 @@ def ide_name_from_workspace_path(path: Path) -> str:
     if path.parent.name == "workspace":
         return path.parent.parent.name
     return path.parent.name
+
+
+def ide_output_name(ide_name: str, strip_versions: bool) -> str:
+    if strip_versions:
+        ide_name = IDE_VERSION_SUFFIX_RE.sub("", ide_name).rstrip()
+    return ide_name
 
 
 def workspace_name_from_workspace_path(path: Path) -> str:
@@ -339,33 +346,55 @@ def iter_input_files(paths: list[Path]) -> Iterator[tuple[Path, str]]:
             raise FileNotFoundError(path)
 
 
-def should_flatten_output(paths: list[Path]) -> bool:
-    if len(paths) != 1:
-        return False
-
-    path = paths[0]
-    if not path.exists():
-        return False
-
+def explicit_ide_root_from_input(path: Path) -> Path | None:
     resolved = path.resolve()
     if resolved.is_file():
-        return resolved.parent.name in {"workspace", ".idea"}
+        if resolved.parent.name == "workspace" and resolved.parent.parent.name == "config":
+            return resolved.parent.parent.parent.resolve()
+        if resolved.parent.name == "workspace":
+            return resolved.parent.parent.resolve()
+        if resolved.parent.name == ".idea":
+            return resolved.parent.parent.resolve()
+        return resolved.parent.resolve()
 
     if not resolved.is_dir():
+        return None
+
+    if resolved.name == "workspace":
+        if resolved.parent.name == "config":
+            return resolved.parent.parent.resolve()
+        return resolved.parent.resolve()
+
+    if resolved.name == ".idea":
+        return resolved.parent.resolve()
+
+    if resolved.name == "config" and (resolved / "workspace").is_dir():
+        return resolved.parent.resolve()
+
+    if (resolved / "workspace").is_dir():
+        return resolved.resolve()
+    if (resolved / "config" / "workspace").is_dir():
+        return resolved.resolve()
+    if (resolved / ".idea").is_dir():
+        return resolved.resolve()
+
+    return resolved.resolve()
+
+
+def should_flatten_output(paths: list[Path], keep_ide_dirs: bool) -> bool:
+    if keep_ide_dirs or not paths:
         return False
 
-    for ide_dir in iter_jetbrains_ide_dirs():
-        try:
-            relative = resolved.relative_to(ide_dir.resolve())
-        except ValueError:
-            continue
+    roots: set[Path] = set()
+    for path in paths:
+        if not path.exists():
+            return False
+        root = explicit_ide_root_from_input(path)
+        if root is None:
+            return False
+        roots.add(root)
 
-        if len(relative.parts) == 1:
-            return True
-
-        return len(relative.parts) >= 2 and relative.parts[1] in {"workspace", "config"}
-
-    return False
+    return len(roots) == 1
 
 
 def workspace_file_has_chat_marker(xml_path: Path) -> bool:
@@ -567,10 +596,15 @@ def decode_event_records(
         verbose_print(verbose, 6, f"end decode_event_records: {path} records={count}")
 
 
-def cache_root_for_ide(output_dir: Path, ide_name: str, flatten_ide_output: bool) -> Path:
+def cache_root_for_ide(
+    output_dir: Path,
+    ide_name: str,
+    flatten_ide_output: bool,
+    strip_ide_versions: bool,
+) -> Path:
     if flatten_ide_output:
         return output_dir
-    return output_dir / sanitize_path_component(ide_name)
+    return output_dir / sanitize_path_component(ide_output_name(ide_name, strip_ide_versions))
 
 
 def cache_root_for_workspace(
@@ -580,11 +614,12 @@ def cache_root_for_workspace(
     flatten_ide_output: bool,
     per_workspace_output: bool,
     no_ide_subdir: bool,
+    strip_ide_versions: bool,
 ) -> Path:
     if no_ide_subdir:
         cache_root = output_dir
     else:
-        cache_root = cache_root_for_ide(output_dir, ide_name, flatten_ide_output)
+        cache_root = cache_root_for_ide(output_dir, ide_name, flatten_ide_output, strip_ide_versions)
     if per_workspace_output:
         cache_root = cache_root / workspace_name_from_workspace_path(workspace_path)
     return cache_root
@@ -1414,19 +1449,55 @@ def main() -> int:
         help="Skip writing a file when an existing export has the same session UID.",
     )
     parser.add_argument(
-        "--workspace-dirs",
-        action="store_true",
-        help="Nest exports under a workspace directory named after each workspace XML file.",
-    )
-    parser.add_argument(
         "--no-ide-dirs",
         action="store_true",
         help="Write all exports directly under the output directory instead of creating separate directories per IDE.",
     )
     parser.add_argument(
+        "--ide-dirs",
+        dest="ide_dirs",
+        action="store_true",
+        help="Keep the top-level IDE directory layer.",
+    )
+    parser.add_argument(
+        "--no-ide-versions",
+        action="store_true",
+        help="Strip trailing version numbers from IDE output directories, turning names like PhpStorm2026.1 into PhpStorm.",
+    )
+    parser.add_argument(
+        "--ide-versions",
+        dest="no_ide_versions",
+        action="store_false",
+        help="Keep trailing version numbers in IDE output directories.",
+    )
+    parser.add_argument(
+        "--workspace-dirs",
+        action="store_true",
+        help="Nest exports under a workspace directory named after each workspace XML file.",
+    )
+    parser.add_argument(
+        "--no-workspace-dirs",
+        dest="workspace_dirs",
+        action="store_false",
+        help="Do not nest exports under a workspace directory.",
+    )
+    parser.add_argument(
         "--no-model-dirs",
         action="store_true",
         help="Write all exports directly under the current output scope instead of creating separate directories per chat model.",
+    )
+    parser.add_argument(
+        "--model-dirs",
+        dest="no_model_dirs",
+        action="store_false",
+        help="Keep the chat model directory layer.",
+    )
+    parser.set_defaults(
+        ide_dirs=False,
+        no_ide_dirs=False,
+        no_ide_versions=False,
+        workspace_dirs=False,
+        no_model_dirs=False,
     )
     file_dates_group = parser.add_mutually_exclusive_group()
     file_dates_group.add_argument(
@@ -1496,9 +1567,10 @@ def main() -> int:
     written_by_model: Counter[str] = Counter()
     verbose = args.verbose
     debug = args.debug
-    flatten_ide_output = should_flatten_output(args.paths)
+    flatten_ide_output = should_flatten_output(args.paths, args.ide_dirs)
     per_workspace_output = args.workspace_dirs
     no_ide_subdir = args.no_ide_dirs
+    strip_ide_versions = args.no_ide_versions
     no_model_dirs = args.no_model_dirs
     current_ide_name: str | None = None
     current_output_scope_key: Path | None = None
@@ -1597,6 +1669,7 @@ def main() -> int:
                 flatten_ide_output,
                 per_workspace_output,
                 no_ide_subdir,
+                strip_ide_versions,
             )
 
             if output_scope_key != current_output_scope_key:

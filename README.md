@@ -7,23 +7,19 @@ It handles two sources of content:
 1. Direct XML chat text stored in `SerializedChatMessage` nodes.
 2. Recovered agent action history from JetBrains `aia-task-history` event logs when the XML assistant message is empty.
 
-The output is grouped by IDE name and `chatModelId`, so the final path shape is:
+The output path is built from these parts:
 
-```text
-<output-dir>\<IDEName>\<chatModelId>\<title>.md
-```
+| Example / option | output-dir | IDEName | workspace | chatModelId | title |
+| --- | --- | --- | --- | --- | --- |
+| Example output path | `C:\tmp\aichat` | `PhpStorm2026.1` | `3CSqcw95aAwwd...` | `chatModelId` | `2026-05-30 12:34:56 - title.md` |
+| Add or edit | `--output-dir` | `--ide-dirs` * or `--ide-versions` * | `--workspace-dirs` | `--model-dirs` * | `--file-dates` * |
+| Remove | n/a | `--no-ide-dirs` or `--no-ide-versions` | `--no-workspace-dirs` * | `--no-model-dirs` | `--no-file-dates` |
 
-If you enable `--workspace-dirs`, the exporter adds a workspace layer:
+`*` marks options that are enabled by default for the path shape shown above. `--no-ide-versions` has no effect when `--no-ide-dirs` is also set. If you pass explicit workspace files under one IDE root, or a single IDE root, the exporter also flattens the IDE layer unless `--ide-dirs` is explicitly specified.
 
-```text
-<output-dir>\<IDEName>\<workspace>\<chatModelId>\<title>.md
-```
+If you enable `--no-ide-dirs`, the exporter skips the top-level IDE folder and writes directly under `<output-dir>/<chatModelId>/`. With `--workspace-dirs`, that becomes `<output-dir>/<workspace>/<chatModelId>/`.
 
-If you enable `--no-ide-dirs`, the exporter skips the top-level `<IDEName>` folder and writes directly under `<output-dir>\<chatModelId>\`. With `--workspace-dirs`, that becomes `<output-dir>\<workspace>\<chatModelId>\`.
-
-If you pass exactly one explicit IDE root or workspace file, the exporter also flattens the IDE layer. `--no-ide-dirs` gives you the same layout explicitly for project-local output paths.
-
-If you enable `--no-model-dirs`, the exporter skips the `<chatModelId>` folder and writes directly under the current output scope. Combined with `--workspace-dirs`, that means the workspace folder becomes the last directory before the markdown file; if the IDE layer is kept, the shape is `<output-dir>\<IDEName>\<workspace>\<title>.md`, and if the IDE layer is flattened, the shape is `<output-dir>\<workspace>\<title>.md`.
+If you enable `--no-model-dirs`, the exporter skips the `<chatModelId>` folder and writes directly under the current output scope. Combined with `--workspace-dirs`, that means the workspace folder becomes the last directory before the markdown file; if the IDE layer is kept, the shape is `<output-dir>/<IDEName>/<workspace>/<title>.md`, and if the IDE layer is flattened, the shape is `<output-dir>/<workspace>/<title>.md`.
 
 At present the tool cannot correlate `workspace/*.xml` files with specific projects. The XML filename is, however, consistent across IDE versions, so you can use `--workspace-dirs` possibly together with `--no-ide-dirs` and then copy the resulting output directories to the appropriate projects with a post-processing script. The post-processing script is left as an exercise for the reader.
 
@@ -56,7 +52,7 @@ The default output directory is `C:\tmp\aichat\` on Windows and `/tmp/aichat` on
 When no explicit paths are provided, the script walks:
 
 ```text
-Windows: %APPDATA%\JetBrains\<IDE>\workspace\*.xml
+Windows: %APPDATA%/JetBrains/<IDE>/workspace/*.xml
 Linux:   ~/.config/JetBrains/<IDE>/workspace/*.xml
 macOS:   ~/Library/Application Support/JetBrains/<IDE>/workspace/*.xml
 WSL:     /mnt/c/Users/<WindowsUser>/AppData/Roaming/JetBrains/<IDE>/workspace/*.xml
@@ -150,7 +146,7 @@ On Unix-like systems, the equivalent default output path is:
 /tmp/aichat/<IDEName>/<chatModelId>/
 ```
 
-If you pass exactly one explicit IDE root or workspace file, it instead writes to:
+If you pass explicit workspace files under one IDE root, or a single IDE root, it instead writes to:
 
 ```text
 C:\tmp\aichat\<chatModelId>\
@@ -178,23 +174,30 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
   - If omitted, the script scans platform-specific JetBrains workspace locations automatically, including WSL-mounted Windows paths when running under WSL.
 - `--output-dir`
   - Base directory for markdown exports.
-  - By default the script creates `<output-dir>\<IDEName>\<chatModelId>\` underneath it.
-  - If you pass exactly one explicit IDE root or workspace file, it writes directly to `<output-dir>\<chatModelId>\`.
-  - `--no-ide-dirs` also writes directly to `<output-dir>\<chatModelId>\`, which is useful for project-local destinations.
-  - With `--workspace-dirs`, the layout becomes `<output-dir>\<IDEName>\<workspace>\<chatModelId>\`, or `<output-dir>\<workspace>\<chatModelId>\` when the layout is flattened.
-  - `--no-model-dirs` removes the `<chatModelId>` layer and writes directly under the current output scope.
+  - By default the script creates `<output-dir>/<IDEName>/<chatModelId>/` underneath it.
+  - If you pass explicit workspace files under one IDE root, or a single IDE root, it writes directly to `<output-dir>/<chatModelId>/` unless `--ide-dirs` is explicitly specified.
+- `--ide-dirs`
+  - Keep the top-level IDE directory layer.
+- `--no-ide-dirs`
+  - Remove the top-level IDE directory layer.
+- `--ide-versions`
+  - Keep trailing version numbers in IDE output directories.
+- `--no-ide-versions`
+  - Strip trailing version numbers from IDE output directories.
+- `--workspace-dirs`
+  - Nest exports under a workspace directory named after each workspace XML file.
+- `--no-workspace-dirs`
+  - Do not nest exports under a workspace directory. This is the default.
+- `--model-dirs`
+  - Keep the chat model directory layer.
+- `--no-model-dirs`
+  - Remove the chat model directory layer.
   - This can be a project-local directory if you want the AI history stored alongside the code.
 - `--task-history-root`
   - Optional root directory containing JetBrains `aia-task-history` files for recovery.
   - If omitted, the script auto-discovers `aia-task-history` directories under the relevant JetBrains roots for the current platform, including mounted Windows paths under WSL.
 - `--ignore-existing`
   - Skip writing a file when an existing export already has the same session UID.
-- `--workspace-dirs`
-  - Nest exports one level deeper under a directory named after each workspace XML file.
-- `--no-ide-dirs`
-  - Write all exports directly under the output directory instead of creating a separate directory per IDE.
-- `--no-model-dirs`
-  - Write all exports directly under the current output scope instead of creating separate directories per model.
 - `--file-dates`
   - Prefix output filenames with the local timestamp of each conversation.
 - `--no-file-dates`
@@ -216,25 +219,25 @@ The per-IDE cache is a performance hint, not a source of truth. If it gets out o
 The exporter keeps a cache under the current output scope:
 
 ```text
-<output-dir>\<IDE>\.aichat_export_cache.json
+<output-dir>/<IDE>/.aichat_export_cache.json
 ```
 
 With `--workspace-dirs`, that becomes:
 
 ```text
-<output-dir>\<IDE>\<workspace>\.aichat_export_cache.json
+<output-dir>/<IDE>/<workspace>/.aichat_export_cache.json
 ```
 
 With `--no-ide-dirs`, the cache lives directly under the output directory:
 
 ```text
-<output-dir>\.aichat_export_cache.json
+<output-dir>/.aichat_export_cache.json
 ```
 
-When you pass exactly one explicit IDE root or workspace file and the exporter flattens the output layout, the cache also lives directly under the output directory:
+When you pass explicit workspace files under one IDE root, or a single IDE root, and the exporter flattens the output layout, the cache also lives directly under the output directory:
 
 ```text
-<output-dir>\.aichat_export_cache.json
+<output-dir>/.aichat_export_cache.json
 ```
 
 That cache stores:
@@ -251,31 +254,31 @@ After writing each markdown file, the exporter also sets the file timestamp from
 Run from the repository root:
 
 ```shell
-python .\aichat_export\extract_aichat.py
+python ./aichat_export/extract_aichat.py
 ```
 
 To export a specific workspace file or directory:
 
 ```shell
-python .\aichat_export\extract_aichat.py C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\workspace\2W9cqLpuxpUxyNVO6Pi0AKhtraW.xml
+python ./aichat_export/extract_aichat.py C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\workspace\2W9cqLpuxpUxyNVO6Pi0AKhtraW.xml
 ```
 
 To override the output directory:
 
 ```shell
-python .\aichat_export\extract_aichat.py --output-dir C:\tmp\aichat_export
+python ./aichat_export/extract_aichat.py --output-dir C:\tmp\aichat_export
 ```
 
 To point at a different task-history root:
 
 ```shell
-python .\aichat_export\extract_aichat.py --task-history-root C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\aia-task-history
+python ./aichat_export/extract_aichat.py --task-history-root C:\Users\<WindowsUser>\AppData\Roaming\JetBrains\PhpStorm2026.1\aia-task-history
 ```
 
 To preserve existing exports when the same session UID already exists:
 
 ```shell
-python .\aichat_export\extract_aichat.py --ignore-existing
+python ./aichat_export/extract_aichat.py --ignore-existing
 ```
 
 To export one IDE from a WSL-mounted Windows JetBrains workspace path:
